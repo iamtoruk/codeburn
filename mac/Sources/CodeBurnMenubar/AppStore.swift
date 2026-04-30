@@ -20,6 +20,10 @@ final class AppStore {
     var selectedProvider: ProviderFilter = .all
     var selectedPeriod: Period = .today
     var selectedInsight: InsightMode = .trend
+    var accentPreset: AccentPreset = ThemeState.shared.preset {
+        didSet { ThemeState.shared.preset = accentPreset }
+    }
+    var showingAccentPicker: Bool = false
     var currency: String = "USD"
     var isLoading: Bool = false
     var lastError: String?
@@ -44,6 +48,12 @@ final class AppStore {
         cache[PayloadCacheKey(period: .today, provider: .all)]?.payload
     }
 
+    /// All-provider payload for the selected period. Used by the tab strip to show
+    /// per-provider costs that match the active period, not just today.
+    var periodAllPayload: MenubarPayload? {
+        cache[PayloadCacheKey(period: selectedPeriod, provider: .all)]?.payload
+    }
+
     var hasCachedData: Bool {
         cache[currentKey] != nil
     }
@@ -55,13 +65,13 @@ final class AppStore {
     /// Switch to a period. Always fetches fresh data so the user never sees stale numbers.
     func switchTo(period: Period) async {
         selectedPeriod = period
-        await refresh(includeOptimize: true)
+        await refresh(includeOptimize: true, force: true)
     }
 
     /// Switch to a provider filter. Always fetches fresh data so the user never sees stale numbers.
     func switchTo(provider: ProviderFilter) async {
         selectedProvider = provider
-        await refresh(includeOptimize: true)
+        await refresh(includeOptimize: true, force: true)
     }
 
     private var inFlightKeys: Set<PayloadCacheKey> = []
@@ -69,15 +79,18 @@ final class AppStore {
     /// Refresh the currently selected (period, provider) combination. Guards against concurrent
     /// fetches for the same key so a slow initial request can't overwrite a newer one that
     /// finished first (which would show stale numbers the user has already moved past).
-    func refresh(includeOptimize: Bool) async {
+    /// When `force` is false (background timer), skips the CLI call if the cache is still fresh.
+    func refresh(includeOptimize: Bool, force: Bool = false) async {
         let key = currentKey
+        if !force, cache[key]?.isFresh == true { return }
         guard !inFlightKeys.contains(key) else { return }
         inFlightKeys.insert(key)
-        let showLoading = cache[key] == nil
-        if showLoading { isLoading = true }
+        if cache[key] == nil {
+            isLoading = true
+        }
         defer {
             inFlightKeys.remove(key)
-            if showLoading { isLoading = false }
+            isLoading = false
         }
         do {
             let fresh = try await DataClient.fetch(period: key.period, provider: key.provider, includeOptimize: includeOptimize)
@@ -86,6 +99,11 @@ final class AppStore {
         } catch {
             lastError = String(describing: error)
             NSLog("CodeBurn: fetch failed for \(key.period.rawValue)/\(key.provider.rawValue): \(error)")
+        }
+
+        let allKey = PayloadCacheKey(period: selectedPeriod, provider: .all)
+        if key != allKey, cache[allKey]?.isFresh != true {
+            await refreshQuietly(period: selectedPeriod)
         }
     }
 
@@ -212,12 +230,29 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
     case codex = "Codex"
     case cursor = "Cursor"
     case copilot = "Copilot"
+    case droid = "Droid"
+    case gemini = "Gemini"
+    case kiro = "Kiro"
+    case kiloCode = "KiloCode"
+    case openclaw = "OpenClaw"
     case opencode = "OpenCode"
     case pi = "Pi"
+    case qwen = "Qwen"
+    case omp = "OMP"
+    case rooCode = "Roo Code"
 
     var id: String { rawValue }
 
-    /// Maps to the CLI's `--provider` argument values.
+    var providerKeys: [String] {
+        switch self {
+        case .cursor: ["cursor", "cursor agent"]
+        case .rooCode: ["roo-code", "roo code"]
+        case .kiloCode: ["kilo-code", "kilocode"]
+        case .openclaw: ["openclaw"]
+        default: [rawValue.lowercased()]
+        }
+    }
+
     var cliArg: String {
         switch self {
         case .all: "all"
@@ -225,8 +260,16 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
         case .codex: "codex"
         case .cursor: "cursor"
         case .copilot: "copilot"
+        case .droid: "droid"
+        case .gemini: "gemini"
+        case .kiloCode: "kilo-code"
+        case .kiro: "kiro"
+        case .openclaw: "openclaw"
         case .opencode: "opencode"
         case .pi: "pi"
+        case .qwen: "qwen"
+        case .omp: "omp"
+        case .rooCode: "roo-code"
         }
     }
 }
@@ -300,6 +343,11 @@ extension Double {
     func asCompactCurrency() -> String {
         let state = CurrencyState.shared
         return String(format: "\(state.symbol)%.2f", self * state.rate)
+    }
+
+    func asCompactCurrencyWhole() -> String {
+        let state = CurrencyState.shared
+        return "\(state.symbol)\(Int((self * state.rate).rounded()))"
     }
 }
 

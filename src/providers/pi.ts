@@ -56,6 +56,10 @@ function getPiSessionsDir(override?: string): string {
   return override ?? join(homedir(), '.pi', 'agent', 'sessions')
 }
 
+function getOmpSessionsDir(override?: string): string {
+  return override ?? join(homedir(), '.omp', 'agent', 'sessions')
+}
+
 async function readFirstEntry(filePath: string): Promise<PiEntry | null> {
   const content = await readSessionFile(filePath)
   if (content === null) return null
@@ -68,7 +72,7 @@ async function readFirstEntry(filePath: string): Promise<PiEntry | null> {
   }
 }
 
-async function discoverSessionsInDir(sessionsDir: string): Promise<SessionSource[]> {
+async function discoverSessionsInDir(sessionsDir: string, providerName: string): Promise<SessionSource[]> {
   const sources: SessionSource[] = []
 
   let projectDirs: string[]
@@ -100,7 +104,7 @@ async function discoverSessionsInDir(sessionsDir: string): Promise<SessionSource
       if (!first || first.type !== 'session') continue
 
       const cwd = first.cwd ?? dirName
-      sources.push({ path: filePath, project: basename(cwd), provider: 'pi' })
+      sources.push({ path: filePath, project: basename(cwd), provider: providerName })
     }
   }
 
@@ -150,7 +154,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         const model = msg.model ?? 'gpt-5'
         const responseId = msg.responseId ?? ''
-        const dedupKey = `pi:${source.path}:${responseId || entry.id || entry.timestamp || String(lineIdx)}`
+        const dedupKey = `${source.provider}:${source.path}:${responseId || entry.id || entry.timestamp || String(lineIdx)}`
 
         if (seenKeys.has(dedupKey)) continue
         seenKeys.add(dedupKey)
@@ -168,7 +172,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         const timestamp = entry.timestamp ?? ''
 
         yield {
-          provider: 'pi',
+          provider: source.provider,
           model,
           inputTokens: input,
           outputTokens: output,
@@ -212,7 +216,7 @@ export function createPiProvider(sessionsDir?: string): Provider {
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSessionsInDir(dir)
+      return discoverSessionsInDir(dir, 'pi')
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
@@ -222,3 +226,33 @@ export function createPiProvider(sessionsDir?: string): Provider {
 }
 
 export const pi = createPiProvider()
+
+export function createOmpProvider(sessionsDir?: string): Provider {
+  const dir = getOmpSessionsDir(sessionsDir)
+
+  return {
+    name: 'omp',
+    displayName: 'OMP',
+
+    modelDisplayName(model: string): string {
+      for (const [key, name] of modelDisplayEntries) {
+        if (model.startsWith(key)) return name
+      }
+      return model
+    },
+
+    toolDisplayName(rawTool: string): string {
+      return toolNameMap[rawTool] ?? rawTool
+    },
+
+    async discoverSessions(): Promise<SessionSource[]> {
+      return discoverSessionsInDir(dir, 'omp')
+    },
+
+    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+      return createParser(source, seenKeys)
+    },
+  }
+}
+
+export const omp = createOmpProvider()

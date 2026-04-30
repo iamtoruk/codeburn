@@ -7,9 +7,12 @@ import { calculateCost } from '../models.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const modelDisplayNames: Record<string, string> = {
-  'gpt-5.3-codex': 'GPT-5.3 Codex',
+  'codex-auto-review': 'Codex Auto Review',
   'gpt-5.4-mini': 'GPT-5.4 Mini',
   'gpt-5.4': 'GPT-5.4',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
+  'gpt-5.2-low': 'GPT-5.2 Low',
+  'gpt-5.2': 'GPT-5.2',
   'gpt-5': 'GPT-5',
   'gpt-4o-mini': 'GPT-4o Mini',
   'gpt-4o': 'GPT-4o',
@@ -132,7 +135,8 @@ async function discoverSessionsInDir(codexDir: string): Promise<SessionSource[]>
 }
 
 function resolveModel(info: CodexEntry['payload'], sessionModel?: string): string {
-  return info?.info?.model
+  return info?.model
+    ?? info?.info?.model
     ?? info?.info?.model_name
     ?? sessionModel
     ?? 'gpt-5'
@@ -164,13 +168,23 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         if (entry.type === 'session_meta') {
           sessionId = entry.payload?.session_id ?? basename(source.path, '.jsonl')
-          sessionModel = entry.payload?.model
+          sessionModel = entry.payload?.model ?? sessionModel
+          continue
+        }
+
+        if (entry.type === 'turn_context' && entry.payload?.model) {
+          sessionModel = entry.payload.model
           continue
         }
 
         if (entry.type === 'response_item' && entry.payload?.type === 'function_call') {
           const rawName = entry.payload.name ?? ''
           pendingTools.push(toolNameMap[rawName] ?? rawName)
+          continue
+        }
+
+        if (entry.type === 'event_msg' && entry.payload?.type === 'patch_apply_end') {
+          pendingTools.push('Edit')
           continue
         }
 

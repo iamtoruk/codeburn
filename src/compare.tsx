@@ -273,14 +273,14 @@ function ComparisonResults({ modelA, modelB, rows, categories, workingStyle, onB
                 <Text color={DIM}>{'  '}{cat.category}</Text>
                 <Text>
                   <Text>{'  '}</Text>
-                  <Text color={cat.winner === 'a' ? BAR_A : DIM}>{FULL_BLOCK.repeat(Math.max(bwA, 1))}</Text>
+                  <Text color={BAR_A}>{FULL_BLOCK.repeat(Math.max(bwA, 1))}</Text>
                   <Text>{' '.repeat(Math.max(0, BAR_MAX_WIDTH - bwA))} </Text>
                   <Text color={cat.winner === 'a' ? GREEN : undefined}>{rateA.padStart(6)}</Text>
                   <Text color={DIM}> {turnsA}</Text>
                 </Text>
                 <Text>
                   <Text>{'  '}</Text>
-                  <Text color={cat.winner === 'b' ? BAR_B : DIM}>{FULL_BLOCK.repeat(Math.max(bwB, 1))}</Text>
+                  <Text color={BAR_B}>{FULL_BLOCK.repeat(Math.max(bwB, 1))}</Text>
                   <Text>{' '.repeat(Math.max(0, BAR_MAX_WIDTH - bwB))} </Text>
                   <Text color={cat.winner === 'b' ? GREEN : undefined}>{rateB.padStart(6)}</Text>
                   <Text color={DIM}> {turnsB}</Text>

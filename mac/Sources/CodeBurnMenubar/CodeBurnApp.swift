@@ -2,11 +2,10 @@ import SwiftUI
 import AppKit
 import Observation
 
-private let refreshIntervalSeconds: UInt64 = 15
+private let refreshIntervalSeconds: UInt64 = 30
 private let nanosPerSecond: UInt64 = 1_000_000_000
 private let refreshIntervalNanos: UInt64 = refreshIntervalSeconds * nanosPerSecond
-/// Fixed so the popover's anchor point doesn't shift each time today's cost changes.
-private let statusItemFixedWidth: CGFloat = 130
+private let statusItemWidth: CGFloat = NSStatusItem.variableLength
 private let popoverWidth: CGFloat = 360
 private let popoverHeight: CGFloat = 660
 private let menubarTitleFontSize: CGFloat = 13
@@ -29,18 +28,155 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var popover: NSPopover!
     private let store = AppStore()
     let updateChecker = UpdateChecker()
-    private var refreshTask: Task<Void, Never>?
+    /// Held for the lifetime of the app to opt out of App Nap and Automatic Termination.
+    private var backgroundActivity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Menubar accessory -- no Dock icon, no app switcher entry.
-        NSApp.setActivationPolicy(.accessory)
+        // On macOS Tahoe (26.x), accessory apps may fail to render their status item
+        // if the activation policy is set before the status item is created. Starting
+        // as a regular app and switching to accessory after setup works around this.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+
+        ProcessInfo.processInfo.automaticTerminationSupportEnabled = false
+        ProcessInfo.processInfo.disableSuddenTermination()
+        backgroundActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .automaticTerminationDisabled, .suddenTerminationDisabled],
+            reason: "CodeBurn menubar polls AI coding cost every 15 seconds while idle in the background."
+        )
 
         restorePersistedCurrency()
         setupStatusItem()
         setupPopover()
+
+        // Switch to accessory policy after status item is set up to hide from Dock
+        DispatchQueue.main.async {
+            NSApp.setActivationPolicy(.accessory)
+        }
         observeStore()
         startRefreshLoop()
+        setupWakeObservers()
+        setupDistributedNotificationListener()
+        installLaunchAgentIfNeeded()
+        registerLoginItemIfNeeded()
         Task { await updateChecker.checkIfNeeded() }
+    }
+
+    private func setupWakeObservers() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.forceRefresh() }
+        }
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.forceRefresh() }
+        }
+    }
+
+    private func setupDistributedNotificationListener() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.codeburn.refresh"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.forceRefresh() }
+        }
+    }
+
+    private func installLaunchAgentIfNeeded() {
+        let fm = FileManager.default
+        let agentName = "com.codeburn.refresh.plist"
+        let home = fm.homeDirectoryForCurrentUser.path
+        let destPath = "\(home)/Library/LaunchAgents/\(agentName)"
+
+        let plist = """
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.codeburn.refresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/osascript</string>
+        <string>-l</string>
+        <string>JavaScript</string>
+        <string>-e</string>
+        <string>ObjC.import("Foundation"); $.NSDistributedNotificationCenter.defaultCenter.postNotificationNameObjectUserInfoDeliverImmediately("com.codeburn.refresh", $(), $(), true)</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>30</integer>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"""
+
+        do {
+            let existing = try? String(contentsOfFile: destPath, encoding: .utf8)
+            if existing == plist { return }
+
+            try fm.createDirectory(atPath: "\(home)/Library/LaunchAgents", withIntermediateDirectories: true)
+            try plist.write(toFile: destPath, atomically: true, encoding: .utf8)
+
+            let unload = Process()
+            unload.launchPath = "/bin/launchctl"
+            unload.arguments = ["unload", destPath]
+            try? unload.run()
+            unload.waitUntilExit()
+
+            let load = Process()
+            load.launchPath = "/bin/launchctl"
+            load.arguments = ["load", destPath]
+            try load.run()
+            load.waitUntilExit()
+        } catch {
+            NSLog("CodeBurn: LaunchAgent setup failed: \(error)")
+        }
+    }
+
+    private func registerLoginItemIfNeeded() {
+        let key = "codeburn.loginItemRegistered"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+
+        let appPath = Bundle.main.bundlePath
+        let script = "tell application \"System Events\" to make login item at end with properties {path:\"\(appPath)\", hidden:false}"
+
+        let process = Process()
+        process.launchPath = "/usr/bin/osascript"
+        process.arguments = ["-e", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                UserDefaults.standard.set(true, forKey: key)
+            }
+        } catch {
+            NSLog("CodeBurn: Login item registration failed: \(error)")
+        }
+    }
+
+    private var lastRefreshTime: Date = .distantPast
+
+    private func forceRefresh() {
+        let now = Date()
+        guard now.timeIntervalSince(lastRefreshTime) > 5 else { return }
+        lastRefreshTime = now
+
+        Task {
+            await store.refresh(includeOptimize: true, force: true)
+            refreshStatusButton()
+        }
     }
 
     /// Loads the currency code persisted by `codeburn currency` so a relaunch picks up where
@@ -65,35 +201,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        refreshTask?.cancel()
-    }
-
     private func startRefreshLoop() {
-        refreshTask = Task { [weak self] in
-            guard let s = self else { return }
-            // First cycle: fetch today so the status icon has a number within seconds of launch.
-            await s.store.refreshQuietly(period: .today)
-            s.refreshStatusButton()
-            await s.store.refresh(includeOptimize: true)
-            s.refreshStatusButton()
-
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: refreshIntervalNanos)
-                guard let s = self else { return }
-                await s.store.refreshQuietly(period: .today)
-                s.refreshStatusButton()
-                await s.store.refresh(includeOptimize: true)
-                s.refreshStatusButton()
-            }
+        Task {
+            await store.refresh(includeOptimize: true)
+            refreshStatusButton()
         }
-
-        // Period tabs are fetched lazily when the user first clicks them in the popover.
-        // An earlier version prefetched every period on launch to make tab switching instant,
-        // but on large session corpora that spawned four concurrent codeburn subprocesses
-        // competing with the main refresh loop for disk and parser time, and the status label
-        // drifted stale for minutes. A per-tab first-click cost of a few seconds is the better
-        // tradeoff on user machines that track thousands of sessions.
     }
 
     private func observeStore() {
@@ -110,15 +222,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - Status Item
 
+    private var isCompact: Bool {
+        UserDefaults.standard.bool(forKey: "CodeBurnMenubarCompact")
+    }
+
     private func setupStatusItem() {
-        // Fixed width so the popover anchor (and thus popover position) doesn't shift
-        // every time today's cost or findings badge changes.
-        statusItem = NSStatusBar.system.statusItem(withLength: statusItemFixedWidth)
+        statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
         guard let button = statusItem.button else { return }
+
+        // Set a simple SF Symbol image immediately to ensure the status item renders.
+        // On macOS Tahoe, status items may fail to appear if only an attributed title
+        // is set during initial setup.
+        let flameConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
+        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
+            .withSymbolConfiguration(flameConfig)
+        flame?.isTemplate = true
+        button.image = flame
+        button.imagePosition = .imageLeading
+
         button.target = self
         button.action = #selector(handleButtonClick(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        refreshStatusButton()
+
+        // Defer the full attributed title setup to ensure initial render completes
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshStatusButton()
+        }
     }
 
     /// Composes the menubar title as a single attributed string with the flame as an inline
@@ -142,21 +271,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let attachment = NSTextAttachment()
         attachment.image = flame
         if let size = flame?.size {
-            // Nudge the image down ~2pt so its visual centre sits on the text baseline mid-line
-            // rather than riding high. Exact value tuned against SF Pro Display 13pt.
-            attachment.bounds = CGRect(x: 0, y: -2, width: size.width, height: size.height)
+            attachment.bounds = CGRect(x: 0, y: -3, width: size.width, height: size.height)
         }
 
         let hasPayload = store.todayPayload != nil
-        let valueText = " " + (store.todayPayload?.current.cost.asCompactCurrency() ?? "$—")
-        let color: NSColor = hasPayload ? .labelColor : .secondaryLabelColor
+        let compact = isCompact
+        let fallback = compact ? "$-" : "$—"
+        let formatted = store.todayPayload?.current.cost
+        let valueText = compact
+            ? (formatted?.asCompactCurrencyWhole() ?? fallback)
+            : " " + (formatted?.asCompactCurrency() ?? fallback)
+
+        var textAttrs: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: -1.0]
+        if !hasPayload {
+            textAttrs[.foregroundColor] = NSColor.secondaryLabelColor
+        }
 
         let composed = NSMutableAttributedString()
         composed.append(NSAttributedString(attachment: attachment))
-        composed.append(NSAttributedString(
-            string: valueText,
-            attributes: [.font: font, .foregroundColor: color]
-        ))
+        composed.append(NSAttributedString(string: valueText, attributes: textAttrs))
         button.attributedTitle = composed
     }
 
@@ -178,7 +311,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func handleButtonClick(_ sender: AnyObject?) {
-        guard let button = statusItem.button else { return }
+        guard let button = statusItem.button,
+              let event = NSApp.currentEvent else { return }
+
+        if event.type == .rightMouseUp {
+            showContextMenu(from: button)
+            return
+        }
+
         if popover.isShown {
             popover.performClose(sender)
         } else {
@@ -186,6 +326,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    private func showContextMenu(from button: NSStatusBarButton) {
+        let menu = NSMenu()
+        let updateItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "Quit CodeBurn", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        statusItem.menu = menu
+        button.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    private func codeburnAlertIcon() -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 32, weight: .medium)
+        guard let symbol = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
+            .withSymbolConfiguration(config) else { return nil }
+        let size = NSSize(width: 64, height: 64)
+        let img = NSImage(size: size, flipped: false) { rect in
+            let symbolSize = symbol.size
+            let x = (rect.width - symbolSize.width) / 2
+            let y = (rect.height - symbolSize.height) / 2
+            symbol.draw(in: NSRect(x: x, y: y, width: symbolSize.width, height: symbolSize.height))
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
+    @objc private func checkForUpdates() {
+        Task {
+            await updateChecker.check()
+            let alert = NSAlert()
+            alert.icon = codeburnAlertIcon()
+            if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
+                alert.messageText = "Update Available"
+                alert.informativeText = "v\(latest) is available (you have v\(updateChecker.currentVersion)). Run:\n\ncodeburn menubar --force"
+            } else {
+                alert.messageText = "Up to Date"
+                alert.informativeText = "You're on the latest version (v\(updateChecker.currentVersion))."
+            }
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 
     // MARK: - NSPopoverDelegate

@@ -1,8 +1,5 @@
 import SwiftUI
 
-private let winColor = Theme.brandAccent
-private let riskColor = Theme.brandAccent
-private let improveColor = Theme.brandAccent
 
 /// Three-category insights panel: wins, improvements, risks.
 /// Wins/risks are derived from current + history; improvements come from the optimize findings.
@@ -133,7 +130,7 @@ private struct TipItem: Identifiable {
     let trailing: String?
 }
 
-private func computeTipGroups(payload: MenubarPayload) -> [TipGroup] {
+@MainActor private func computeTipGroups(payload: MenubarPayload) -> [TipGroup] {
     let stats = computeHistoryStats(history: payload.history.daily)
 
     // What's working
@@ -201,9 +198,9 @@ private func computeTipGroups(payload: MenubarPayload) -> [TipGroup] {
     }
 
     return [
-        TipGroup(label: "What's working", icon: "checkmark.circle.fill", color: winColor, items: wins),
-        TipGroup(label: "What to improve", icon: "arrow.up.right.circle.fill", color: improveColor, items: improvements),
-        TipGroup(label: "Risks", icon: "exclamationmark.triangle.fill", color: riskColor, items: risks),
+        TipGroup(label: "What's working", icon: "checkmark.circle.fill", color: Theme.brandAccent, items: wins),
+        TipGroup(label: "What to improve", icon: "arrow.up.right.circle.fill", color: Theme.brandAccent, items: improvements),
+        TipGroup(label: "Risks", icon: "exclamationmark.triangle.fill", color: Theme.brandAccent, items: risks),
     ]
 }
 
@@ -225,7 +222,7 @@ private func computeHistoryStats(history: [DailyHistoryEntry]) -> HistoryStats {
     }()
     let now = Date()
     let today = calendar.startOfDay(for: now)
-    let costByDate = Dictionary(uniqueKeysWithValues: history.map { ($0.date, $0.cost) })
+    let costByDate = Dictionary(history.map { ($0.date, $0.cost) }, uniquingKeysWith: +)
 
     let lastWeekStart = calendar.date(byAdding: .day, value: -6, to: today)
     let priorWeekStart = calendar.date(byAdding: .day, value: -13, to: today)

@@ -37,6 +37,30 @@ function assistantMessage(opts: { messageId: string; outputTokens: number; tools
   })
 }
 
+function transcriptSessionStart(sessionId: string) {
+  return JSON.stringify({ type: 'session.start', data: { sessionId, producer: 'copilot-agent' } })
+}
+
+function transcriptUserMessage(content: string) {
+  return JSON.stringify({ type: 'user.message', data: { content, attachments: [] } })
+}
+
+function transcriptAssistantMessage(opts: { messageId: string; content?: string; reasoningText?: string; toolCallIds?: string[] }) {
+  return JSON.stringify({
+    type: 'assistant.message',
+    data: {
+      messageId: opts.messageId,
+      content: opts.content ?? '',
+      reasoningText: opts.reasoningText ?? '',
+      toolRequests: (opts.toolCallIds ?? []).map((id, i) => ({
+        toolCallId: id,
+        name: i === 0 ? 'read_file' : 'run_in_terminal',
+        type: 'function',
+      })),
+    },
+  })
+}
+
 describe('copilot provider - JSONL parsing', () => {
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'copilot-test-'))
@@ -155,9 +179,75 @@ describe('copilot provider - JSONL parsing', () => {
     for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
 
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.messageId).toBeUndefined()
     expect(calls[0]!.outputTokens).toBe(80)
     expect(calls[0]!.model).toBe('gpt-4.1')
+  })
+
+  it('infers OpenAI auto bucket for transcript toolCallId prefix call_', async () => {
+    const eventsPath = await createSessionDir('sess-tr-call', [
+      transcriptSessionStart('sess-tr-call'),
+      transcriptUserMessage('check model inference'),
+      transcriptAssistantMessage({
+        messageId: 'msg-1',
+        content: 'done',
+        toolCallIds: ['call_abc123'],
+      }),
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('copilot-openai-auto')
+  })
+
+  it('infers Anthropic auto bucket for transcript toolCallId prefixes tooluse_/toolu_vrtx_', async () => {
+    const eventsPath = await createSessionDir('sess-tr-claude', [
+      transcriptSessionStart('sess-tr-claude'),
+      transcriptUserMessage('check model inference'),
+      transcriptAssistantMessage({
+        messageId: 'msg-1',
+        content: 'done',
+        toolCallIds: ['tooluse_XY', 'toolu_vrtx_01ABC'],
+      }),
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('copilot-anthropic-auto')
+  })
+
+  it('chooses the dominant inferred transcript model when prefixes are mixed', async () => {
+    const eventsPath = await createSessionDir('sess-tr-mixed', [
+      transcriptSessionStart('sess-tr-mixed'),
+      transcriptUserMessage('mixed'),
+      transcriptAssistantMessage({
+        messageId: 'msg-1',
+        content: 'one',
+        toolCallIds: ['toolu_bdrk_123'],
+      }),
+      transcriptAssistantMessage({
+        messageId: 'msg-2',
+        content: 'two',
+        toolCallIds: ['call_1'],
+      }),
+      transcriptAssistantMessage({
+        messageId: 'msg-3',
+        content: 'three',
+        toolCallIds: ['call_2'],
+      }),
+    ])
+
+    const source = { path: eventsPath, project: 'test', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(3)
+    expect(calls.every(c => c.model === 'copilot-openai-auto')).toBe(true)
   })
 })
 
@@ -174,7 +264,7 @@ describe('copilot provider - discoverSessions', () => {
     await createSessionDir('sess-disc-001', [modelChange('gpt-4.1')])
     await createSessionDir('sess-disc-002', [modelChange('gpt-4.1')])
 
-    const provider = createCopilotProvider(tmpDir)
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/vscode')
     const sessions = await provider.discoverSessions()
 
     expect(sessions).toHaveLength(2)
@@ -185,7 +275,7 @@ describe('copilot provider - discoverSessions', () => {
   it('reads project name from workspace.yaml cwd', async () => {
     await createSessionDir('sess-disc-003', [modelChange('gpt-4.1')], '/home/user/myapp')
 
-    const provider = createCopilotProvider(tmpDir)
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/vscode')
     const sessions = await provider.discoverSessions()
 
     expect(sessions).toHaveLength(1)
@@ -198,7 +288,7 @@ describe('copilot provider - discoverSessions', () => {
     await writeFile(join(sessionDir, 'workspace.yaml'), 'cwd: "/home/user/myapp"  # project root\n')
     await writeFile(join(sessionDir, 'events.jsonl'), '\n')
 
-    const provider = createCopilotProvider(tmpDir)
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/vscode')
     const sessions = await provider.discoverSessions()
 
     expect(sessions).toHaveLength(1)
@@ -206,7 +296,7 @@ describe('copilot provider - discoverSessions', () => {
   })
 
   it('returns empty when directory does not exist', async () => {
-    const provider = createCopilotProvider('/nonexistent/path')
+    const provider = createCopilotProvider('/nonexistent/path', '/nonexistent/vscode')
     const sessions = await provider.discoverSessions()
     expect(sessions).toHaveLength(0)
   })
@@ -215,9 +305,24 @@ describe('copilot provider - discoverSessions', () => {
     const emptyDir = join(tmpDir, 'empty-session')
     await mkdir(emptyDir, { recursive: true })
 
-    const provider = createCopilotProvider(tmpDir)
+    const provider = createCopilotProvider(tmpDir, '/nonexistent/vscode')
     const sessions = await provider.discoverSessions()
     expect(sessions).toHaveLength(0)
+  })
+
+  it('discovers VS Code workspace transcripts', async () => {
+    const wsDir = join(tmpDir, 'vscode-ws')
+    const transcriptsDir = join(wsDir, 'abc123', 'GitHub.copilot-chat', 'transcripts')
+    await mkdir(transcriptsDir, { recursive: true })
+    await writeFile(join(wsDir, 'abc123', 'workspace.json'), JSON.stringify({ folder: 'file:///home/user/myapp' }))
+    await writeFile(join(transcriptsDir, 'session-1.jsonl'), JSON.stringify({ type: 'session.start', data: { sessionId: 's1', producer: 'copilot-agent' } }) + '\n')
+
+    const provider = createCopilotProvider('/nonexistent/legacy', wsDir)
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.project).toBe('myapp')
+    expect(sessions[0]!.path).toContain('session-1.jsonl')
   })
 })
 
@@ -242,6 +347,8 @@ describe('copilot provider - metadata', () => {
     expect(copilot.modelDisplayName('gpt-5-mini')).toBe('GPT-5 Mini')
     expect(copilot.modelDisplayName('o3')).toBe('o3')
     expect(copilot.modelDisplayName('o4-mini')).toBe('o4-mini')
+    expect(copilot.modelDisplayName('copilot-openai-auto')).toBe('Copilot (OpenAI auto)')
+    expect(copilot.modelDisplayName('copilot-anthropic-auto')).toBe('Copilot (Anthropic auto)')
     expect(copilot.modelDisplayName('unknown-model-xyz')).toBe('unknown-model-xyz')
   })
 

@@ -399,7 +399,7 @@ private func buildTrendBars(from days: [DailyHistoryEntry]) -> [TrendBar] {
         f.timeZone = .current
         return f
     }()
-    let entryByDate = Dictionary(uniqueKeysWithValues: days.map { ($0.date, $0) })
+    let entryByDate = Dictionary(days.map { ($0.date, $0) }, uniquingKeysWith: { _, new in new })
     let today = calendar.startOfDay(for: Date())
     let todayKey = formatter.string(from: today)
 
@@ -837,7 +837,7 @@ private func computeAllStats(payload: MenubarPayload) -> AllStats {
         peakDaySpend = "—"
     }
 
-    let costByDate = Dictionary(uniqueKeysWithValues: history.map { ($0.date, $0.cost) })
+    let costByDate = Dictionary(history.map { ($0.date, $0.cost) }, uniquingKeysWith: +)
 
     var currentStreak = 0
     for offset in 0..<400 {

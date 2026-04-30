@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.9.4 - 2026-04-29
+
+### Added (CLI)
+- **OpenClaw provider.** Parses JSONL agent logs from `~/.openclaw/agents/` with legacy path support (`.clawdbot`, `.moltbot`, `.moldbot`). Token usage from assistant message `usage` blocks.
+- **Roo Code provider.** Reads Cline-family `ui_messages.json` from VS Code `globalStorage/rooveterinaryinc.roo-cline/tasks/`.
+- **KiloCode provider.** Reads Cline-family `ui_messages.json` from VS Code `globalStorage/kilocode.kilo-code/tasks/`.
+- **Qwen CLI provider.** Parses JSONL sessions from `~/.qwen/projects/<project>/chats/`.
+- **Droid provider.** Parses sessions from `~/.factory/projects/`.
+- **Durable daily cache.** Cache hydration extracted into shared `ensureCacheHydrated()` called by all commands. Schema migration fills missing fields instead of nuking the cache. Old cache versions backed up before reset. Atomic file writes with fsync.
+- **Copilot auto-model buckets.** Transcript inference uses auto-model naming for cleaner dashboard display.
+- **Cursor model aliases.** Built-in aliases for Cursor proxy model names.
+
+### Fixed (CLI)
+- **Gemini provider updated for JSONL format.** Supports Gemini CLI 0.39+ which switched from JSON to JSONL.
+- **Duplicate `hydrateCache()` call in JSON reports.** Removed redundant cache hydration inside `runJsonReport()`.
+
+### Changed (CLI)
+- Daily cache version bumped to v4 with backward-compatible migration (v2+ supported).
+- LiteLLM pricing snapshot replaces hardcoded pricing for Qwen and new models.
+- 16 providers now supported (was 10).
+
+### Added (macOS menubar)
+- **OpenClaw, Roo Code, KiloCode, Qwen, Droid tabs.** Agent tab strip updated for all new providers.
+- **Instant cached data display.** Shows cached data immediately instead of blocking on CLI refresh.
+
+### Fixed (macOS menubar)
+- **Menubar stops updating after first load.** Background refresh was silently skipped by the cache TTL guard. Data loaded once, then froze. Fixes #179.
+- **Menubar not dimming on inactive screens.**
+- **Performance improvements.** Reduced unnecessary redraws and CLI invocations.
+
+### Added (macOS menubar)
+- **Right-click context menu.** Right-click the status bar icon for "Check for Updates" and "Quit CodeBurn".
+- **Version label in footer.**
+
+### Changed
+- README restructured with honeycomb provider hero image, 2x2 screenshot grid, and complete inline reference.
+- `bunx codeburn` added as alternative install option.
+
+## 0.9.3 - 2026-04-28
+
+### Added (CLI)
+- **Gemini CLI provider.** Parses `~/.gemini/tmp/<project>/chats/session-*.json` from Gemini CLI 0.38+. Uses real embedded token counts (input, output, cached, thoughts) with correct cached/fresh separation to avoid double-charging. Pricing for gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-2.5-pro, gemini-2.5-flash. Tool normalization (ReadFile->Read, SearchText->Grep, Shell->Bash). Closes #166.
+- **Kiro provider.** Parses `.chat` JSON session files with token estimation and auto-model naming (`kiro-auto`). Costed at Sonnet 4.5 rates via `BUILTIN_ALIASES`.
+- **Copilot VS Code workspace transcripts.** Copilot now reads transcripts from VS Code's `workspaceStorage/*/GitHub.copilot-chat/transcripts/` in addition to the legacy `~/.copilot/session-state/` path. Tokens estimated from content length, model inferred from tool call ID prefixes. Fixes #161.
+- **Auto-model naming.** Cursor, Copilot, and Kiro store transparent model names (`cursor-auto`, `copilot-auto`, `kiro-auto`) instead of guessing the underlying model.
+
+### Fixed (CLI)
+- **Cursor provider dropped all data older than 35 days.** Hardcoded lookback silently excluded bubbles outside a 5-week window, making `--period all` return $0. Increased to 180 days. Fixes #159, fixes #163.
+- **Cursor-agent subagent transcript discovery.** Scans `subagents/` subdirectories.
+
+### Added (macOS menubar)
+- **Gemini, Kiro, Copilot, OMP tabs.** Agent tab strip now shows all detected providers. Cursor + Cursor Agent merged into a single Cursor tab.
+- **Accent color picker.** 9 Apple-style system presets in the menubar header, persisted via UserDefaults.
+- **Tab costs match selected period.** Provider tab costs now reflect the active period (Today/7 Days/30 Days/etc.) instead of always showing today.
+
+### Changed
+- Daily cache version bumped to v4 (forces recompute with auto-model naming).
+- Cursor cache versioned to invalidate stale model names.
+- Case-insensitive provider key matching for tab cost lookups.
+
+## 0.9.2 - 2026-04-28
+
+### Fixed
+- **Cursor provider reported $0 on newer Cursor versions.** Cursor v3 stores zero token counts in bubbles. Now estimates tokens from text length when counts are zero. Fixes #159.
+- **Cursor provider dropped rows with NULL `createdAt`.** The SQL filter silently excluded bubbles without a timestamp. Now includes them with a fallback timestamp. Fixes #163.
+- **AgentKv entries with plain string content were skipped.** Not all agentKv content is a JSON array; plain strings are now counted toward usage.
+- **Subagent transcripts were not discovered.** Transcripts inside `subagents/` subdirectories are now picked up by the cursor-agent provider.
+
+## 0.9.1 - 2026-04-25
+
+### Added
+- **`codeburn yield` command.** Correlates AI sessions with git history to categorize spend by outcome: **productive** (code shipped to main), **reverted** (commits later undone), or **abandoned** (work that never committed). Shows percentage breakdown so you know not just what you spent, but what happened to it. Accepts `--today`, `--week`, `--month` flags.
+
+## 0.9.0 - 2026-04-24
+
+### Added (CLI)
+- **Claude Max 5x plan preset.** `codeburn plan claude-max-5x` sets a $100/month budget for heavy Claude Code users.
+
+### Fixed (CLI)
+- **Cursor provider failed on newer versions.** Cursor 0.50+ stores session data in `agentKv:blob:*` entries instead of `bubbleId:*`. Added fallback parser that extracts usage from the new format.
+- **Cursor-agent provider missed Composer 2 sessions.** Composer 2 stores transcripts in `agent-transcripts/<UUID>/<UUID>.jsonl` subdirectories instead of `.txt` files. Now scans both formats. Fixes #142.
+- **Codex showed wrong model names.** Model info is now extracted from `turn_context` entries, showing exact names like "GPT-5.4" instead of generic "GPT-5".
+- **Codex edit detection showed 0 edit turns.** Codex records file modifications as `patch_apply_end` events, not tool calls. Now tracks these events to enable one-shot rate and retry metrics.
+- **Compare chart bar colors didn't match legend.** Non-winning model bars were grayed out despite the legend showing both colors. Bars now always display their assigned colors.
+
+### Fixed (macOS menubar)
+- **Menubar icon invisible on macOS Tahoe (26.x).** Status item failed to render on macOS 26.4+ due to window server registration timing. Fixed by starting as regular app, activating, then switching to accessory mode after setup. Fixes #146.
+- **High CPU usage (~14%).** Removed duplicate refresh timer, increased LaunchAgent interval to 30s, added 5-second debounce on wake events.
+
+## 0.8.9 - 2026-04-22
+
+### Fixed
+- **Menubar showed stale prices.** The "all providers" query used `end: now` while per-provider queries used `end: endOfDay`, causing sessions timestamped after the capture moment to be excluded from totals. Now uses `periodInfo.range` consistently across all queries.
+
+### Changed (macOS menubar)
+- **Variable-width status item is now the default.** The menubar pill hugs the rendered text in both compact and default modes instead of reserving a fixed 130pt slot.
+
+## 0.8.8 - 2026-04-22
+
+### Fixed (CLI)
+- **OOM crash on large session files.** `scanJsonlFile` and `parseSessionFile` loaded entire files into memory via `readViaStream` (which defeated its own streaming by joining all lines back into one string). Switched both to the existing `readSessionLines` async generator that yields one line at a time. Contributed by @maucher (#132).
+
+### Added (macOS menubar)
+- **Compact mode.** Opt-in tighter menubar display: no decimals, variable width that hugs the text. Enable with `defaults write CodeBurnMenubar CodeBurnMenubarCompact -bool true`. Default off.
+
+### Fixed (macOS menubar, shipped alongside via mac-v0.8.8)
+- **Plan tab never loaded on Claude Code 2.1.x.** Keychain credential lookup filtered on `kSecAttrAccount == "default"`, but Claude Code writes the macOS login username. Removed the hardcoded allowlist; the service name is sufficient to scope the query.
+- **Four keychain prompts on debug builds.** Collapsed two-phase keychain enumeration into a single `SecItemCopyMatching` call.
+- **App Nap override not sticking.** The `beginActivity` token was immediately overridden by AppKit. Now disables `automaticTerminationSupport` and `suddenTermination` at the process level.
+
+## 0.8.7 - 2026-04-21
+
+### Added
+- **MiniMax-M2.7 and MiniMax-M2.7-highspeed pricing.** Added to `FALLBACK_PRICING` plus display names so MiniMax sessions show up with the right cost and readable labels when users route MiniMax through providers like OpenCode. Rates verified against MiniMax's live paygo pricing: base model $0.3/M input, $1.2/M output; highspeed $0.6/M input, $2.4/M output; cache read $0.06/M, cache write $0.375/M on both.
+- **OMP provider (Oh My Pi).** Auto-discovers sessions at `~/.omp/agent/sessions/*.jsonl` and tracks them alongside Pi. Shares Pi's JSONL parser via a `providerName` parameter, so OMP rows keep their own `omp:` dedup prefix and never cross-dedupe with Pi on a shared `conversationId` namespace. `codeburn report --provider omp` filters to OMP only; the default combined view includes both. Contributed by @cgrossde (#59).
+- **`codeburn model-alias` command.** Maps any provider-emitted model name to a canonical pricing name so cost rows no longer read `$0.00` when a proxy rewrites names. Aliases persist in `~/.config/codeburn/config.json` under `modelAliases`. Usage: `codeburn model-alias <from> <to>` to set, `--list` to view, `--remove <from>` to clear. User aliases resolve before the built-in list. Contributed by @cgrossde (#59).
+- **Built-in aliases for Anthropic-compatible proxy format.** `anthropic--claude-4.6-opus`, `anthropic--claude-4.6-sonnet`, `anthropic--claude-4.5-opus`, `anthropic--claude-4.5-sonnet`, and `anthropic--claude-4.5-haiku` now resolve to canonical Claude names and price correctly with no user configuration. `getCanonicalName` also strips `provider/` prefixes before alias resolution so double-wrapped forms like `anthropic/anthropic--claude-4.6-opus` work the same way. Contributed by @cgrossde (#59).
+
+### Fixed (CLI)
+- **Prototype pollution in alias resolution.** A model literally named `__proto__` leaked `Object.prototype` through the `??` fallback chain in `resolveAlias`, which then crashed `canonical.startsWith` downstream. The resolver now uses `Object.hasOwn` checks for both user and built-in alias maps. Caught by the existing prototype-pollution test suite during the #59 merge.
+
+### Fixed (macOS menubar, shipped alongside via mac-v0.8.7)
+- **Menubar label froze in the background and only refreshed when you clicked the icon.** Three independent causes fixed:
+  - `prefetchAll` on launch spawned four concurrent `codeburn` subprocesses that competed with the main refresh loop for disk and parser time. Removed; period tabs now fetch lazily on first click.
+  - `NSStatusItem` sometimes deferred the status bar paint for an accessory app, so `attributedTitle` updates hit memory but not the screen until the popover opened. Explicit `needsDisplay` + `display()` after each update forces the paint.
+  - **The real root cause:** macOS App Nap / Automatic Termination was suspending the app whenever the icon sat idle in the background, stretching the 15-second refresh Task's sleep indefinitely. Holding a `ProcessInfo.beginActivity` token for the life of the app opts out. Confirmed via `log show`: `_kLSApplicationWouldBeTerminatedByTALKey` now stays at 0.
+- Subprocess `QualityOfService` lifted to `.userInitiated` so `codeburn` runs at terminal speed when spawned from the menubar.
+
+### Skipped
+- 0.8.6 was never published to npm. The version was briefly planned and then skipped to align CLI and macOS menubar versioning at 0.8.7.
+
+### Notes
+- If you are on 0.8.5 and do not use MiniMax, Oh My Pi, or a proxy that rewrites model names to the `anthropic--claude-X.Y-tier` format, CLI behavior is unchanged and you can safely stay on 0.8.5.
+- macOS menubar users on `mac-v0.8.6` or earlier should update: the refresh loop only ticks reliably from `mac-v0.8.7` onward. The in-app update pill surfaces within 2 days, or quit and re-run `npx codeburn menubar` to pull immediately.
+
 ## 0.8.5 - 2026-04-21
 
 ### Fixed

@@ -31,7 +31,7 @@ type ParsedTurn = {
   assistant: AssistantTurn
 }
 
-const CURSOR_AGENT_DEFAULT_MODEL = 'claude-sonnet-4-5'
+const CURSOR_AGENT_COST_MODEL = 'claude-sonnet-4-5'
 const CHARS_PER_TOKEN = 4
 const MAX_USER_TEXT_LENGTH = 500
 const DIGITS_ONLY = /^\d+$/
@@ -129,8 +129,12 @@ function prettifyProjectId(raw: string): string {
 }
 
 function resolveModel(raw: string | null | undefined): string {
-  if (!raw || raw === 'default') return CURSOR_AGENT_DEFAULT_MODEL
+  if (!raw || raw === 'default') return 'cursor-agent-auto'
   return raw
+}
+
+function costModel(model: string): string {
+  return model === 'cursor-agent-auto' ? CURSOR_AGENT_COST_MODEL : model
 }
 
 function toConversationId(transcriptPath: string): string {
@@ -158,6 +162,58 @@ function extractUserQuery(userBlock: string): string {
 
   const combined = chunks.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
   return combined.slice(0, MAX_USER_TEXT_LENGTH)
+}
+
+function parseJsonlTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
+  const lines = raw.split(/\r?\n/).filter(l => l.trim())
+  if (lines.length === 0) return { turns: [], recognized: false }
+
+  const turns: ParsedTurn[] = []
+  let currentUserMessage = ''
+
+  for (const line of lines) {
+    let entry: { role?: string; message?: { content?: Array<{ type?: string; text?: string; name?: string }> } }
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+
+    if (entry.role === 'user') {
+      const texts = (entry.message?.content ?? [])
+        .filter(c => c.type === 'text')
+        .map(c => c.text ?? '')
+      const combined = texts.join(' ')
+      currentUserMessage = extractUserQuery(combined) || combined.slice(0, MAX_USER_TEXT_LENGTH)
+      continue
+    }
+
+    if (entry.role === 'assistant' && currentUserMessage) {
+      const content = entry.message?.content ?? []
+      const bodyParts: string[] = []
+      const tools: string[] = []
+
+      for (const block of content) {
+        if (block.type === 'text' && block.text) {
+          bodyParts.push(block.text)
+        } else if (block.type === 'tool_use' && block.name) {
+          tools.push(`cursor:${block.name.toLowerCase()}`)
+        }
+      }
+
+      turns.push({
+        userMessage: currentUserMessage,
+        assistant: {
+          body: bodyParts.join('\n').trim(),
+          reasoning: '',
+          tools,
+        },
+      })
+      currentUserMessage = ''
+    }
+  }
+
+  return { turns, recognized: turns.length > 0 }
 }
 
 function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
@@ -299,7 +355,8 @@ function createParser(
         }
 
         const transcript = await readFile(source.path, 'utf-8')
-        const parsed = parseTranscript(transcript)
+        const isJsonl = source.path.endsWith('.jsonl')
+        const parsed = isJsonl ? parseJsonlTranscript(transcript) : parseTranscript(transcript)
 
         if (!parsed.recognized) {
           process.stderr.write(`codeburn: skipped ${basename(source.path)}: unrecognized cursor-agent transcript format\n`)
@@ -325,7 +382,7 @@ function createParser(
           seenKeys.add(deduplicationKey)
 
           const costUSD = calculateCost(
-            model,
+            costModel(model),
             inputTokens,
             outputTokens + reasoningTokens,
             0,
@@ -371,7 +428,7 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
     displayName: 'Cursor Agent',
 
     modelDisplayName(model: string): string {
-      if (model === 'default') return modelDisplayNames.default
+      if (model === 'cursor-agent-auto') return 'Cursor (auto)'
       const label = modelDisplayNames[model] ?? model
       return `${label} (est.)`
     },
@@ -395,15 +452,44 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
 
         const transcriptEntries = await readdir(transcriptDir, { withFileTypes: true })
         for (const transcript of transcriptEntries) {
-          if (!transcript.isFile()) continue
-          if (!transcript.name.endsWith('.txt')) continue
+          // Legacy format: .txt files directly in agent-transcripts/
+          if (transcript.isFile() && transcript.name.endsWith('.txt')) {
+            const transcriptPath = join(transcriptDir, transcript.name)
+            sources.push({
+              path: transcriptPath,
+              project: projectId,
+              provider: 'cursor-agent',
+            })
+            continue
+          }
 
-          const transcriptPath = join(transcriptDir, transcript.name)
-          sources.push({
-            path: transcriptPath,
-            project: projectId,
-            provider: 'cursor-agent',
-          })
+          // Composer 2 format: UUID subdirectories with .jsonl files
+          if (transcript.isDirectory() && UUID_LIKE.test(transcript.name)) {
+            const subdir = join(transcriptDir, transcript.name)
+            const subEntries = await readdir(subdir, { withFileTypes: true }).catch(() => [])
+            for (const sub of subEntries) {
+              if (sub.isFile() && (sub.name.endsWith('.jsonl') || sub.name.endsWith('.txt'))) {
+                sources.push({
+                  path: join(subdir, sub.name),
+                  project: projectId,
+                  provider: 'cursor-agent',
+                })
+              }
+              // Subagent transcripts inside a subagents/ directory
+              if (sub.isDirectory() && sub.name === 'subagents') {
+                const subagentEntries = await readdir(join(subdir, sub.name), { withFileTypes: true }).catch(() => [])
+                for (const sa of subagentEntries) {
+                  if (!sa.isFile()) continue
+                  if (!sa.name.endsWith('.jsonl') && !sa.name.endsWith('.txt')) continue
+                  sources.push({
+                    path: join(subdir, sub.name, sa.name),
+                    project: projectId,
+                    provider: 'cursor-agent',
+                  })
+                }
+              }
+            }
+          }
         }
       }
 

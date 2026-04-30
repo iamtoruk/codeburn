@@ -361,6 +361,98 @@ describe('codebuff provider - JSONL parsing', () => {
   })
 })
 
+describe('codebuff provider - sessionId channel scoping', () => {
+  it('produces distinct sessionIds for the same chatId across different channel roots', async () => {
+    const chatId = '2026-04-14T10-00-00.000Z'
+    const channelA = join(tmpDir, 'manicode')
+    const channelB = join(tmpDir, 'manicode-dev')
+    const cwd = '/Users/test/shared-project'
+    const runState = { sessionState: { projectContext: { cwd } } }
+
+    const chatDirA = await writeChat(
+      channelA,
+      'shared-project',
+      chatId,
+      [userMessage('hi'), aiMessage({ credits: 5 })],
+      runState,
+    )
+    const chatDirB = await writeChat(
+      channelB,
+      'shared-project',
+      chatId,
+      [userMessage('hi'), aiMessage({ credits: 5 })],
+      runState,
+    )
+
+    const providerA = createCodebuffProvider(channelA)
+    const providerB = createCodebuffProvider(channelB)
+
+    const sourceA = { path: chatDirA, project: 'shared-project', provider: 'codebuff' }
+    const sourceB = { path: chatDirB, project: 'shared-project', provider: 'codebuff' }
+
+    const callsA: ParsedProviderCall[] = []
+    for await (const call of providerA.createSessionParser(sourceA, new Set()).parse()) {
+      callsA.push(call)
+    }
+    const callsB: ParsedProviderCall[] = []
+    for await (const call of providerB.createSessionParser(sourceB, new Set()).parse()) {
+      callsB.push(call)
+    }
+
+    expect(callsA).toHaveLength(1)
+    expect(callsB).toHaveLength(1)
+    // The whole point of the fix: same chatId + same project should NOT
+    // collapse into a single session when the chats live under different
+    // channel roots.
+    expect(callsA[0]!.sessionId).not.toBe(callsB[0]!.sessionId)
+    expect(callsA[0]!.sessionId).toBe(`manicode/${chatId}`)
+    expect(callsB[0]!.sessionId).toBe(`manicode-dev/${chatId}`)
+    // The sessionId must not contain ':' -- src/parser.ts keys sessions as
+    // `${provider}:${sessionId}:${project}` and reconstructs the session via
+    // `key.split(':')[1]`, so a colon would truncate the id downstream.
+    expect(callsA[0]!.sessionId).not.toContain(':')
+    expect(callsB[0]!.sessionId).not.toContain(':')
+  })
+
+  it('includes the channel name in the sessionId', async () => {
+    const chatId = '2026-04-14T10-00-00.000Z'
+    const channelRoot = join(tmpDir, 'manicode-staging')
+    const chatDir = await writeChat(channelRoot, 'proj', chatId, [aiMessage({ credits: 3 })])
+
+    const provider = createCodebuffProvider(channelRoot)
+    const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
+      calls.push(call)
+    }
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe(`manicode-staging/${chatId}`)
+    expect(calls[0]!.sessionId).not.toContain(':')
+  })
+
+  it('falls back to the chatId when the path does not match the expected structure', async () => {
+    const chatId = '2026-04-14T10-00-00.000Z'
+    // Not the canonical <channel>/projects/<proj>/chats/<chatId> layout.
+    const chatDir = join(tmpDir, 'oddly-shaped', chatId)
+    await mkdir(chatDir, { recursive: true })
+    await writeFile(
+      join(chatDir, 'chat-messages.json'),
+      JSON.stringify([aiMessage({ credits: 2 })]),
+    )
+
+    const provider = createCodebuffProvider(tmpDir)
+    const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
+      calls.push(call)
+    }
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe(chatId)
+  })
+})
+
 describe('codebuff provider - display names', () => {
   const provider = createCodebuffProvider('/tmp')
 

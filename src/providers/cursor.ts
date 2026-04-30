@@ -7,7 +7,7 @@ import { readCachedResults, writeCachedResults } from '../cursor-cache.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, type SqliteDatabase } from '../sqlite.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
-const CURSOR_DEFAULT_MODEL = 'claude-sonnet-4-5'
+const CURSOR_COST_MODEL = 'claude-sonnet-4-5'
 
 const modelDisplayNames: Record<string, string> = {
   'claude-4.5-opus-high-thinking': 'Opus 4.5 (Thinking)',
@@ -18,10 +18,12 @@ const modelDisplayNames: Record<string, string> = {
   'composer-1': 'Composer 1',
   'grok-code-fast-1': 'Grok Code Fast',
   'gemini-3-pro': 'Gemini 3 Pro',
+  'gpt-5.2-low': 'GPT-5.2 Low',
+  'gpt-5.2': 'GPT-5.2',
   'gpt-5.1-codex-high': 'GPT-5.1 Codex',
   'gpt-5': 'GPT-5',
   'gpt-4.1': 'GPT-4.1',
-  'default': 'Auto (Sonnet est.)',
+  'cursor-auto': 'Cursor (auto)',
 }
 
 type BubbleRow = {
@@ -31,8 +33,31 @@ type BubbleRow = {
   created_at: string | null
   conversation_id: string | null
   user_text: string | null
+  text_length: number | null
+  bubble_type: number | null
   code_blocks: string | null
 }
+
+type AgentKvRow = {
+  key: string
+  role: string | null
+  content: string | null
+  request_id: string | null
+  content_length: number
+}
+
+type AgentKvContent = {
+  type?: string
+  text?: string
+  providerOptions?: {
+    cursor?: {
+      modelName?: string
+      requestId?: string
+    }
+  }
+}
+
+const CHARS_PER_TOKEN = 4
 
 function getCursorDbPath(): string {
   if (process.platform === 'darwin') {
@@ -64,12 +89,12 @@ function extractLanguages(codeBlocksJson: string | null): string[] {
 }
 
 function resolveModel(raw: string | null): string {
-  if (!raw || raw === 'default') return CURSOR_DEFAULT_MODEL
+  if (!raw || raw === 'default') return CURSOR_COST_MODEL
   return raw
 }
 
 function modelForDisplay(raw: string | null): string {
-  if (!raw || raw === 'default') return 'default'
+  if (!raw || raw === 'default') return 'cursor-auto'
   return raw
 }
 
@@ -81,10 +106,24 @@ const BUBBLE_QUERY_BASE = `
     json_extract(value, '$.createdAt') as created_at,
     json_extract(value, '$.conversationId') as conversation_id,
     substr(json_extract(value, '$.text'), 1, 500) as user_text,
+    length(json_extract(value, '$.text')) as text_length,
+    json_extract(value, '$.type') as bubble_type,
     json_extract(value, '$.codeBlocks') as code_blocks
   FROM cursorDiskKV
   WHERE key LIKE 'bubbleId:%'
-    AND json_extract(value, '$.tokenCount.inputTokens') > 0
+`
+
+const AGENTKV_QUERY = `
+  SELECT
+    key,
+    json_extract(value, '$.role') as role,
+    json_extract(value, '$.content') as content,
+    json_extract(value, '$.providerOptions.cursor.requestId') as request_id,
+    length(value) as content_length
+  FROM cursorDiskKV
+  WHERE key LIKE 'agentKv:blob:%'
+    AND hex(substr(value, 1, 1)) = '7B'
+  ORDER BY ROWID ASC
 `
 
 const USER_MESSAGES_QUERY = `
@@ -95,13 +134,13 @@ const USER_MESSAGES_QUERY = `
   FROM cursorDiskKV
   WHERE key LIKE 'bubbleId:%'
     AND json_extract(value, '$.type') = 1
-    AND json_extract(value, '$.createdAt') > ?
-  ORDER BY json_extract(value, '$.createdAt') ASC
+    AND (json_extract(value, '$.createdAt') > ? OR json_extract(value, '$.createdAt') IS NULL)
+  ORDER BY ROWID ASC
 `
 
 const BUBBLE_QUERY_SINCE = BUBBLE_QUERY_BASE + `
-    AND json_extract(value, '$.createdAt') > ?
-  ORDER BY json_extract(value, '$.createdAt') ASC
+    AND (json_extract(value, '$.createdAt') > ? OR json_extract(value, '$.createdAt') IS NULL)
+  ORDER BY ROWID ASC
 `
 
 function validateSchema(db: SqliteDatabase): boolean {
@@ -135,8 +174,8 @@ function parseBubbles(db: SqliteDatabase, seenKeys: Set<string>): { calls: Parse
   const results: ParsedProviderCall[] = []
   let skipped = 0
 
-  const DEFAULT_LOOKBACK_DAYS = 35
-  const timeFloor = new Date(Date.now() - DEFAULT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString()
+  const LOOKBACK_DAYS = 180
+  const timeFloor = new Date(Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString()
 
   const userMessages = buildUserMessageMap(db, timeFloor)
 
@@ -149,9 +188,19 @@ function parseBubbles(db: SqliteDatabase, seenKeys: Set<string>): { calls: Parse
 
   for (const row of rows) {
     try {
-      const inputTokens = row.input_tokens ?? 0
-      const outputTokens = row.output_tokens ?? 0
-      if (inputTokens === 0 && outputTokens === 0) continue
+      let inputTokens = row.input_tokens ?? 0
+      let outputTokens = row.output_tokens ?? 0
+
+      // Cursor v3 stores zero token counts — estimate from text length
+      if (inputTokens === 0 && outputTokens === 0) {
+        const textLen = row.text_length ?? 0
+        if (textLen === 0) continue
+        if (row.bubble_type === 1) {
+          inputTokens = Math.ceil(textLen / CHARS_PER_TOKEN)
+        } else {
+          outputTokens = Math.ceil(textLen / CHARS_PER_TOKEN)
+        }
+      }
 
       const createdAt = row.created_at ?? ''
       const conversationId = row.conversation_id ?? 'unknown'
@@ -165,7 +214,7 @@ function parseBubbles(db: SqliteDatabase, seenKeys: Set<string>): { calls: Parse
 
       const costUSD = calculateCost(pricingModel, inputTokens, outputTokens, 0, 0, 0)
 
-      const timestamp = createdAt || ''
+      const timestamp = createdAt || new Date().toISOString()
       const convMessages = userMessages.get(conversationId) ?? []
       const userQuestion = convMessages.length > 0 ? convMessages.shift()! : ''
       const assistantText = row.user_text ?? ''
@@ -207,6 +256,123 @@ function parseBubbles(db: SqliteDatabase, seenKeys: Set<string>): { calls: Parse
   return { calls: results }
 }
 
+function extractModelFromContent(content: AgentKvContent[]): string | null {
+  for (const c of content) {
+    if (c.providerOptions?.cursor?.modelName) {
+      return c.providerOptions.cursor.modelName
+    }
+  }
+  return null
+}
+
+function extractTextLength(content: AgentKvContent[]): number {
+  let total = 0
+  for (const c of content) {
+    if (c.text) total += c.text.length
+  }
+  return total
+}
+
+function parseAgentKv(db: SqliteDatabase, seenKeys: Set<string>): { calls: ParsedProviderCall[] } {
+  const results: ParsedProviderCall[] = []
+
+  let rows: AgentKvRow[]
+  try {
+    rows = db.query<AgentKvRow>(AGENTKV_QUERY)
+  } catch {
+    return { calls: results }
+  }
+
+  const sessions: Map<string, { inputChars: number; outputChars: number; model: string | null; userText: string }> = new Map()
+  let currentRequestId = 'unknown'
+  let turnIndex = 0
+
+  for (const row of rows) {
+    if (!row.role || !row.content) continue
+
+    let content: AgentKvContent[]
+    let plainTextLength = 0
+    try {
+      const parsed = JSON.parse(row.content)
+      if (Array.isArray(parsed)) {
+        content = parsed
+      } else {
+        content = []
+        plainTextLength = row.content.length
+      }
+    } catch {
+      content = []
+      plainTextLength = row.content.length
+    }
+
+    const requestId = row.request_id ?? currentRequestId
+    if (requestId !== currentRequestId) {
+      currentRequestId = requestId
+      turnIndex = 0
+    }
+
+    const textLength = plainTextLength || extractTextLength(content)
+    const model = extractModelFromContent(content)
+
+    if (row.role === 'user') {
+      const existing = sessions.get(requestId) ?? { inputChars: 0, outputChars: 0, model: null, userText: '' }
+      existing.inputChars += textLength
+      if (!existing.userText) {
+        const text = content[0]?.text ?? row.content
+        const queryMatch = text.match(/<user_query>([\s\S]*?)<\/user_query>/)
+        existing.userText = queryMatch ? queryMatch[1].trim().slice(0, 500) : text.slice(0, 500)
+      }
+      sessions.set(requestId, existing)
+    } else if (row.role === 'assistant') {
+      const existing = sessions.get(requestId) ?? { inputChars: 0, outputChars: 0, model: null, userText: '' }
+      existing.outputChars += textLength
+      if (model) existing.model = model
+      sessions.set(requestId, existing)
+    } else if (row.role === 'tool' || row.role === 'system') {
+      const existing = sessions.get(requestId) ?? { inputChars: 0, outputChars: 0, model: null, userText: '' }
+      existing.inputChars += textLength
+      sessions.set(requestId, existing)
+    }
+  }
+
+  for (const [requestId, session] of sessions) {
+    if (session.inputChars === 0 && session.outputChars === 0) continue
+
+    const inputTokens = Math.ceil(session.inputChars / CHARS_PER_TOKEN)
+    const outputTokens = Math.ceil(session.outputChars / CHARS_PER_TOKEN)
+    const dedupKey = `cursor:agentKv:${requestId}`
+
+    if (seenKeys.has(dedupKey)) continue
+    seenKeys.add(dedupKey)
+
+    const pricingModel = resolveModel(session.model)
+    const displayModel = modelForDisplay(session.model)
+    const costUSD = calculateCost(pricingModel, inputTokens, outputTokens, 0, 0, 0)
+
+    results.push({
+      provider: 'cursor',
+      model: displayModel,
+      inputTokens,
+      outputTokens,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      webSearchRequests: 0,
+      costUSD,
+      tools: [],
+      bashCommands: [],
+      timestamp: new Date().toISOString(),
+      speed: 'standard',
+      deduplicationKey: dedupKey,
+      userMessage: session.userText,
+      sessionId: requestId,
+    })
+  }
+
+  return { calls: results }
+}
+
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
@@ -239,7 +405,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           return
         }
 
-        const { calls } = parseBubbles(db, seenKeys)
+        const { calls: bubbleCalls } = parseBubbles(db, seenKeys)
+        const { calls: agentKvCalls } = parseAgentKv(db, seenKeys)
+        const calls = [...bubbleCalls, ...agentKvCalls]
 
         await writeCachedResults(source.path, calls)
 

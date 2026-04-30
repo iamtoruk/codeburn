@@ -1,5 +1,5 @@
 import { readdir, readFile, stat } from 'fs/promises'
-import { basename, join } from 'path'
+import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
 import { calculateCost } from '../models.js'
@@ -316,12 +316,37 @@ async function discoverSessionsInBase(baseDir: string): Promise<SessionSource[]>
   return results
 }
 
+// Downstream aggregation groups sessions by `(provider, sessionId, project)`
+// (see src/parser.ts). Codebuff chat folders are ISO timestamps, which means
+// the same `chatId` can legitimately appear under each channel root
+// (`manicode`, `manicode-dev`, `manicode-staging`) and even resolve to the
+// same project cwd. To keep those sessions distinct we include the channel
+// identity in the sessionId. The channel is derived from the fixed path
+// structure Codebuff writes on disk: `<channelRoot>/projects/<project>/chats/<chatId>`.
+// Returns null when the path doesn't match that shape so the caller can fall
+// back to a plain chatId.
+//
+// We use '/' as the channel/chatId separator rather than ':' because
+// src/parser.ts builds its session key as `${provider}:${sessionId}:${project}`
+// and reconstructs the sessionId with `key.split(':')[1]` -- any colon inside
+// sessionId would get truncated to just the channel name downstream.
+function extractChannelFromChatDir(chatDir: string): string | null {
+  const chatsDir = dirname(chatDir)
+  if (basename(chatsDir) !== 'chats') return null
+  const projectDir = dirname(chatsDir)
+  const projectsDir = dirname(projectDir)
+  if (basename(projectsDir) !== 'projects') return null
+  const channel = basename(dirname(projectsDir))
+  return channel ? channel : null
+}
+
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const chatDir = source.path
       const chatId = basename(chatDir)
-      const sessionId = `${basename(chatDir)}`
+      const channel = extractChannelFromChatDir(chatDir)
+      const sessionId = channel ? `${channel}/${chatId}` : chatId
       const fallbackTs = parseChatIdToIso(chatId)
 
       const messages = await readJson<CodebuffChatMessage[]>(

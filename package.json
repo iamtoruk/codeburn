@@ -1,6 +1,6 @@
 {
   "name": "codeburn",
-  "version": "0.8.5",
+  "version": "0.9.4",
   "description": "See where your AI coding tokens go - by task, tool, model, and project",
   "type": "module",
   "main": "./dist/cli.js",
@@ -11,7 +11,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
+    "bundle-litellm": "node scripts/bundle-litellm.mjs",
+    "build": "node scripts/bundle-litellm.mjs && tsup",
     "dev": "tsx src/cli.ts",
     "test": "vitest",
     "prepublishOnly": "npm run build"

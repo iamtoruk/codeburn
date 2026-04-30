@@ -25,34 +25,33 @@ struct AgentTabStrip: View {
         }
     }
 
-    /// Drive tab visibility and per-tab cost labels from the *all-provider* payload (today),
-    /// not the currently selected provider's payload. Without this, switching to Codex (which
-    /// has no data) would hide every other tab including Claude.
-    private var allProvidersToday: MenubarPayload {
+    private var todayAll: MenubarPayload {
         store.todayPayload ?? store.payload
     }
 
+    private var periodAll: MenubarPayload {
+        store.periodAllPayload ?? store.payload
+    }
+
     private var visibleFilters: [ProviderFilter] {
-        // Show a tab for every provider detected on this machine. The CLI decides what
-        // to include in the providers map based on session dirs / credential files it
-        // finds, so zero-cost-today is still "installed" and the user expects to see
-        // it. Only providers that aren't installed at all are absent from the map.
         let detectedKeys = Set(
-            allProvidersToday.current.providers.keys.map { $0.lowercased() }
+            todayAll.current.providers.keys.map { $0.lowercased() }
         )
         return ProviderFilter.allCases.filter { filter in
             if filter == .all { return true }
-            return detectedKeys.contains(filter.rawValue.lowercased())
+            return filter.providerKeys.contains(where: detectedKeys.contains)
         }
     }
 
     private func cost(for filter: ProviderFilter) -> Double? {
-        switch filter {
-        case .all:
-            return allProvidersToday.current.cost
-        default:
-            let key = filter.rawValue.lowercased()
-            return allProvidersToday.current.providers[key]
+        let data = periodAll
+        if filter == .all { return data.current.cost }
+        let providers = Dictionary(
+            data.current.providers.map { ($0.key.lowercased(), $0.value) },
+            uniquingKeysWith: +
+        )
+        return filter.providerKeys.reduce(0.0) { sum, key in
+            sum + (providers[key] ?? 0)
         }
     }
 }
@@ -86,15 +85,23 @@ private struct AgentTab: View {
 }
 
 extension ProviderFilter {
-    var color: Color {
+    @MainActor var color: Color {
         switch self {
         case .all: return Theme.brandAccent
         case .claude: return Theme.categoricalClaude
         case .codex: return Theme.categoricalCodex
         case .cursor: return Theme.categoricalCursor
         case .copilot: return Color(red: 0x6D/255.0, green: 0x8F/255.0, blue: 0xA6/255.0)
+        case .droid: return Color(red: 0x7C/255.0, green: 0x3A/255.0, blue: 0xED/255.0)
+        case .gemini: return Color(red: 0x44/255.0, green: 0x85/255.0, blue: 0xF4/255.0)
+        case .kiloCode: return Color(red: 0x00/255.0, green: 0x96/255.0, blue: 0x88/255.0)
+        case .kiro: return Color(red: 0x4A/255.0, green: 0x9E/255.0, blue: 0xC4/255.0)
+        case .openclaw: return Color(red: 0xDA/255.0, green: 0x70/255.0, blue: 0x56/255.0)
         case .opencode: return Color(red: 0x5B/255.0, green: 0x83/255.0, blue: 0x5B/255.0)
         case .pi: return Color(red: 0xB2/255.0, green: 0x6B/255.0, blue: 0x3D/255.0)
+        case .qwen: return Color(red: 0x61/255.0, green: 0x5E/255.0, blue: 0xEB/255.0)
+        case .omp: return Color(red: 0x8B/255.0, green: 0x5C/255.0, blue: 0xB0/255.0)
+        case .rooCode: return Color(red: 0x4C/255.0, green: 0xAF/255.0, blue: 0x50/255.0)
         }
     }
 }
