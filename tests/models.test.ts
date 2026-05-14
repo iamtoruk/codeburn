@@ -158,6 +158,18 @@ describe('calculateCost - OMP names produce non-zero cost', () => {
   })
 })
 
+describe('calculateCost - Claude cache write durations', () => {
+  it('prices 1-hour cache writes at 1.6x the 5-minute cache write rate', () => {
+    const fiveMinute = calculateCost('claude-opus-4-7', 0, 0, 1_000_000, 0, 0)
+    const oneHour = calculateCost('claude-opus-4-7', 0, 0, 1_000_000, 0, 0, 'standard', 1_000_000)
+    const mixed = calculateCost('claude-opus-4-7', 0, 0, 100_000, 0, 0, 'standard', 60_000)
+
+    expect(fiveMinute).toBeCloseTo(6.25, 6)
+    expect(oneHour).toBeCloseTo(10, 6)
+    expect(mixed).toBeCloseTo(0.85, 6)
+  })
+})
+
 describe('existing model names still resolve', () => {
   it('canonical claude-opus-4-6', () => {
     expect(getModelCosts('claude-opus-4-6')).not.toBeNull()

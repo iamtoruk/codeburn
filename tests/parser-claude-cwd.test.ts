@@ -31,7 +31,14 @@ function dayRange(day: string): DateRange {
   }
 }
 
-async function writeClaudeSession(projectSlug: string, sessionId: string, cwd: string, timestamp: string): Promise<void> {
+async function writeClaudeSession(
+  projectSlug: string,
+  sessionId: string,
+  cwd: string,
+  timestamp: string,
+  usage: Record<string, unknown> = { input_tokens: 100, output_tokens: 50 },
+  model = 'claude-sonnet-4-5',
+): Promise<void> {
   const projectDir = join(tmpDir, 'projects', projectSlug)
   await mkdir(projectDir, { recursive: true })
   const filePath = join(projectDir, `${sessionId}.jsonl`)
@@ -44,12 +51,9 @@ async function writeClaudeSession(projectSlug: string, sessionId: string, cwd: s
       id: `msg-${sessionId}`,
       type: 'message',
       role: 'assistant',
-      model: 'claude-sonnet-4-5',
+      model,
       content: [],
-      usage: {
-        input_tokens: 100,
-        output_tokens: 50,
-      },
+      usage,
     },
   }) + '\n')
 
@@ -156,5 +160,53 @@ describe('Claude cwd project paths', () => {
     expect(projects).toHaveLength(1)
     expect(projects[0]!.sessions).toHaveLength(4)
     expect(projects[0]!.projectPath).toBe('fallback/slug')
+  })
+})
+
+describe('Claude cache creation pricing', () => {
+  it('prices 1-hour cache writes from usage.cache_creation at the 2x input rate', async () => {
+    await writeClaudeSession(
+      'cache-pricing',
+      'one-hour-cache',
+      '/tmp/cache-pricing',
+      '2099-05-05T10:00:00.000Z',
+      {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 60_120,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 0,
+          ephemeral_1h_input_tokens: 60_120,
+        },
+      },
+      'claude-opus-4-7',
+    )
+
+    const projects = await parseAllSessions(dayRange('2099-05-05'), 'claude')
+
+    expect(projects).toHaveLength(1)
+    expect(projects[0]!.sessions[0]!.totalCacheWriteTokens).toBe(60_120)
+    expect(projects[0]!.totalCostUSD).toBeCloseTo(0.6012, 6)
+  })
+
+  it('falls back to the legacy 5-minute cache write rate when split fields are absent', async () => {
+    await writeClaudeSession(
+      'legacy-cache-pricing',
+      'legacy-cache',
+      '/tmp/legacy-cache-pricing',
+      '2099-05-06T10:00:00.000Z',
+      {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 60_120,
+      },
+      'claude-opus-4-7',
+    )
+
+    const projects = await parseAllSessions(dayRange('2099-05-06'), 'claude')
+
+    expect(projects).toHaveLength(1)
+    expect(projects[0]!.sessions[0]!.totalCacheWriteTokens).toBe(60_120)
+    expect(projects[0]!.totalCostUSD).toBeCloseTo(0.37575, 6)
   })
 })

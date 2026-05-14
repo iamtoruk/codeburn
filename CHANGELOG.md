@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added (CLI)
+- **IBM Bob provider.** Discovers IBM Bob IDE task history, reuses the
+  Cline-family parser for token/cost records, extracts model tags and
+  workspace-based project names from session data. Closes #248.
+
+### Fixed (CLI)
+- **Claude 1-hour cache write pricing.** 1-hour cache writes are now priced
+  at 2x base input (previously used the 5-minute 1.25x rate for all writes).
+  Daily cache bumped to v6 so stale totals are recomputed. Closes #276.
+- **OpenCode MCP usage now counted.** OpenCode stores MCP tool calls as
+  `<server>_<tool>` names, which the shared MCP pipeline did not recognize.
+  The provider now normalizes these to the canonical `mcp__<server>__<tool>`
+  form so MCP breakdowns and `optimize` work correctly. Closes #308.
+- **Mangled project names in dashboard.** The By Project and Top Sessions
+  panels decoded slugs by splitting on `-`, which broke directory names
+  containing dashes or dots (e.g. `my-project` rendered as `my/project`).
+  Now uses the real project path instead. Closes #196.
+- **Cursor undated bubble rows misattributed to Today.** Bubble rows without
+  a `createdAt` timestamp were defaulting to the current date, inflating
+  Today's spend. Now skipped at both the SQL and application level.
+
 ## 0.9.8 - 2026-05-10
 
 ### Added (CLI)

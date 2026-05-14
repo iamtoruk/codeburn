@@ -84,6 +84,23 @@ The `.github/workflows/block-claude-coauthor.yml` workflow rejects any PR whose 
 
 If a flagged PR rejects on this check, the workflow prints the exact rebase command to fix it.
 
+## Before You Start
+
+**Comment on the issue first.** Before writing code for a feature or new provider, leave a comment on the relevant issue saying what you plan to do. Wait for a maintainer to confirm the approach. Unsolicited PRs that duplicate work already in progress or take an incompatible approach will be closed.
+
+**One PR at a time.** We will not review a second PR from you until the first is merged or closed. This keeps the review queue manageable and ensures each contribution gets proper attention.
+
+## Adding a New Provider
+
+New providers have the highest bar because broken parsing silently produces wrong data for users. Before opening a PR:
+
+1. **Install the tool and use it.** Generate real sessions by actually coding with the provider. We do this ourselves for every provider we ship.
+2. **Test against real data.** Run `npm run dev -- today` and `npm run dev -- models` with your real sessions and confirm the output looks correct — costs are non-zero, model names resolve, session counts match what you see in the tool.
+3. **Include proof in the PR.** Attach a screenshot or terminal output showing codeburn correctly parsing your real sessions. PRs for new providers without evidence of local testing will not be reviewed.
+4. **Do not rely on AI-generated guesses about storage paths or schemas.** Tools change their data formats between versions. The only way to know the current schema is to install the tool and inspect the actual files on disk.
+
+PRs that add a provider based solely on online documentation or AI-generated code, without evidence of testing against real data, will be closed.
+
 ## Pull Requests
 
 1. Fork or branch from `main`.

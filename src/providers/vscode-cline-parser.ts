@@ -24,6 +24,23 @@ export function getVSCodeGlobalStoragePath(extensionId: string): string {
 
 export async function discoverClineTasks(extensionId: string, providerName: string, displayName: string, overrideDir?: string): Promise<SessionSource[]> {
   const baseDir = overrideDir ?? getVSCodeGlobalStoragePath(extensionId)
+  return discoverClineTasksInBaseDirs([baseDir], providerName, displayName)
+}
+
+export async function discoverClineTasksInBaseDirs(baseDirs: string[], providerName: string, displayName: string): Promise<SessionSource[]> {
+  const sources: SessionSource[] = []
+  const seen = new Set<string>()
+  for (const baseDir of baseDirs) {
+    for (const source of await discoverClineTasksInBaseDir(baseDir, providerName, displayName)) {
+      if (seen.has(source.path)) continue
+      seen.add(source.path)
+      sources.push(source)
+    }
+  }
+  return sources
+}
+
+async function discoverClineTasksInBaseDir(baseDir: string, providerName: string, displayName: string): Promise<SessionSource[]> {
   const tasksDir = join(baseDir, 'tasks')
   const sources: SessionSource[] = []
 
@@ -50,28 +67,43 @@ export async function discoverClineTasks(extensionId: string, providerName: stri
 }
 
 const MODEL_TAG_RE = /<model>([^<]+)<\/model>/
+const WORKSPACE_DIR_RE = /Current Workspace Directory \(([^)]+)\)/
 
-function extractModelFromHistory(taskDir: string): Promise<string> {
+type HistoryMeta = { model: string; workspace: string | null }
+
+function extractHistoryMeta(taskDir: string, fallbackModel: string): Promise<HistoryMeta> {
   return readFile(join(taskDir, 'api_conversation_history.json'), 'utf-8')
     .then(raw => {
       const msgs = JSON.parse(raw) as Array<{ role?: string; content?: Array<{ text?: string }> }>
-      if (!Array.isArray(msgs)) return 'cline-auto'
+      if (!Array.isArray(msgs)) return { model: fallbackModel, workspace: null }
+      let model: string | null = null
+      let workspace: string | null = null
       for (const msg of msgs) {
         if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
         for (const block of msg.content) {
-          const match = typeof block.text === 'string' && MODEL_TAG_RE.exec(block.text)
-          if (match) {
-            const raw = match[1]
-            return raw.includes('/') ? raw.split('/').pop()! : raw
+          if (typeof block.text !== 'string') continue
+          if (!model) {
+            const mm = MODEL_TAG_RE.exec(block.text)
+            if (mm) model = mm[1].includes('/') ? mm[1].split('/').pop()! : mm[1]
           }
+          if (!workspace) {
+            const wm = WORKSPACE_DIR_RE.exec(block.text)
+            if (wm) workspace = wm[1]
+          }
+          if (model && workspace) break
         }
+        if (model && workspace) break
       }
-      return 'cline-auto'
+      return { model: model ?? fallbackModel, workspace }
     })
-    .catch(() => 'cline-auto')
+    .catch(() => ({ model: fallbackModel, workspace: null }))
 }
 
-export function createClineParser(source: SessionSource, seenKeys: Set<string>, providerName: string): SessionParser {
+function workspaceToProject(workspace: string): string {
+  return basename(workspace) || workspace
+}
+
+export function createClineParser(source: SessionSource, seenKeys: Set<string>, providerName: string, fallbackModel = 'cline-auto'): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const taskDir = source.path
@@ -93,7 +125,10 @@ export function createClineParser(source: SessionSource, seenKeys: Set<string>, 
 
       if (!Array.isArray(uiMessages)) return
 
-      const model = await extractModelFromHistory(taskDir)
+      const meta = await extractHistoryMeta(taskDir, fallbackModel)
+      const model = meta.model
+      const project = meta.workspace ? workspaceToProject(meta.workspace) : undefined
+      const projectPath = meta.workspace ?? undefined
 
       let userMessage = ''
       for (const msg of uiMessages) {
@@ -156,6 +191,8 @@ export function createClineParser(source: SessionSource, seenKeys: Set<string>, 
           deduplicationKey: dedupKey,
           userMessage: index === 0 ? userMessage : '',
           sessionId: taskId,
+          project,
+          projectPath,
         }
       }
     },

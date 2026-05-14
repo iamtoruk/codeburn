@@ -46,8 +46,8 @@ describe('aggregateProjectsIntoDays', () => {
         sessions: [{
           sessionId: 's1',
           project: 'p',
-          firstTimestamp: '2026-04-09T10:00:00Z',
-          lastTimestamp: '2026-04-10T08:00:00Z',
+          firstTimestamp: '2026-04-09T10:00:00',
+          lastTimestamp: '2026-04-10T08:00:00',
           totalCostUSD: 10,
           totalInputTokens: 0,
           totalOutputTokens: 0,
@@ -57,14 +57,14 @@ describe('aggregateProjectsIntoDays', () => {
           turns: [
             {
               userMessage: 'hi',
-              timestamp: '2026-04-09T10:00:00Z',
+              timestamp: '2026-04-09T10:00:00',
               sessionId: 's1',
               category: 'coding',
               retries: 0,
               hasEdits: true,
               assistantCalls: [
-                makeCall('2026-04-09T10:00:00Z', 4),
-                makeCall('2026-04-10T08:00:00Z', 6),
+                makeCall('2026-04-09T10:00:00', 4),
+                makeCall('2026-04-10T08:00:00', 6),
               ],
             },
           ],
@@ -92,8 +92,8 @@ describe('aggregateProjectsIntoDays', () => {
         sessions: [{
           sessionId: 's1',
           project: 'p',
-          firstTimestamp: '2026-04-09T10:00:00Z',
-          lastTimestamp: '2026-04-09T10:05:00Z',
+          firstTimestamp: '2026-04-09T10:00:00',
+          lastTimestamp: '2026-04-09T10:05:00',
           totalCostUSD: 3,
           totalInputTokens: 0,
           totalOutputTokens: 0,
@@ -103,12 +103,12 @@ describe('aggregateProjectsIntoDays', () => {
           turns: [
             {
               userMessage: 'hi',
-              timestamp: '2026-04-09T10:00:00Z',
+              timestamp: '2026-04-09T10:00:00',
               sessionId: 's1',
               category: 'coding',
               retries: 0,
               hasEdits: true,
-              assistantCalls: [makeCall('2026-04-09T10:00:00Z', 3)],
+              assistantCalls: [makeCall('2026-04-09T10:00:00', 3)],
             },
           ],
           modelBreakdown: {},
@@ -138,8 +138,8 @@ describe('aggregateProjectsIntoDays', () => {
         sessions: [{
           sessionId: 's1',
           project: 'p',
-          firstTimestamp: '2026-04-09T23:59:00Z',
-          lastTimestamp: '2026-04-10T00:10:00Z',
+          firstTimestamp: '2026-04-09T23:59:00',
+          lastTimestamp: '2026-04-10T00:10:00',
           totalCostUSD: 1,
           totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheWriteTokens: 0,
           apiCalls: 0,
@@ -151,7 +151,7 @@ describe('aggregateProjectsIntoDays', () => {
       }),
     ]
     const days = aggregateProjectsIntoDays(projects)
-    const expectedDate = dateKey('2026-04-09T23:59:00Z')
+    const expectedDate = dateKey('2026-04-09T23:59:00')
     expect(days[0]!.date).toBe(expectedDate)
     expect(days[0]!.sessions).toBe(1)
   })
@@ -162,18 +162,18 @@ describe('aggregateProjectsIntoDays', () => {
         sessions: [{
           sessionId: 's1',
           project: 'p',
-          firstTimestamp: '2026-04-10T10:00:00Z',
-          lastTimestamp: '2026-04-10T10:00:00Z',
+          firstTimestamp: '2026-04-10T10:00:00',
+          lastTimestamp: '2026-04-10T10:00:00',
           totalCostUSD: 10,
           totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheWriteTokens: 0,
           apiCalls: 2,
           turns: [
             {
-              userMessage: 'x', timestamp: '2026-04-10T10:00:00Z', sessionId: 's1',
+              userMessage: 'x', timestamp: '2026-04-10T10:00:00', sessionId: 's1',
               category: 'coding', retries: 0, hasEdits: false,
               assistantCalls: [
-                makeCall('2026-04-10T10:00:00Z', 7, 'Opus 4.7', 'claude'),
-                makeCall('2026-04-10T10:00:00Z', 3, 'gpt-5', 'codex'),
+                makeCall('2026-04-10T10:00:00', 7, 'Opus 4.7', 'claude'),
+                makeCall('2026-04-10T10:00:00', 3, 'gpt-5', 'codex'),
               ],
             },
           ],

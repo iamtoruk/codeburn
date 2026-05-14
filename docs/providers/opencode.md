@@ -4,7 +4,7 @@ OpenCode (sst/opencode).
 
 - **Source:** `src/providers/opencode.ts`
 - **Loading:** lazy (`src/providers/index.ts:59-75`)
-- **Test:** `tests/providers/opencode.test.ts` (558 lines, the largest provider test)
+- **Test:** `tests/providers/opencode.test.ts` (676 lines, the largest provider test)
 
 ## Where it reads from
 
@@ -20,14 +20,18 @@ None.
 
 ## Deduplication
 
-Per `<sessionId>:<messageId>` (`opencode.ts:242`).
+Per `<sessionId>:<messageId>`.
 
 ## Quirks
 
-- **Schema validation is loud.** When a required table is missing, the parser logs an actionable warning telling the user which table is gone and what version of OpenCode it expects (`opencode.ts:104-131`). This is the right behavior; do not silently swallow these.
-- Source paths are encoded as `<dbPath>:<sessionId>` (`opencode.ts:147-150`).
-- Each message's `parts` are indexed (`opencode.ts:177-191`); preserving the order matters for reasoning-token correctness.
+- **Schema validation is loud.** When a required table is missing, the parser logs an actionable warning telling the user which table is gone and what version of OpenCode it expects. This is the right behavior; do not silently swallow these.
+- Source paths are encoded as `<dbPath>:<sessionId>`.
+- Each message's `parts` are indexed; preserving the order matters for reasoning-token correctness.
 - Tokens are reported across `input`, `output`, `reasoning`, `cache.read`, and `cache.write`. Anthropic semantics.
+- External MCP tools are stored as `<server>_<tool>` names (for example
+  `clickup_clickup_get_task`). The provider normalizes those to CodeBurn's
+  canonical `mcp__<server>__<tool>` names before aggregation so shared MCP
+  panels and `optimize` findings count OpenCode usage.
 
 ## When fixing a bug here
 

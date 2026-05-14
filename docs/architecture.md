@@ -128,14 +128,14 @@ type Provider = {
 }
 ```
 
-`src/providers/index.ts` registers eighteen providers across two tiers:
+`src/providers/index.ts` registers nineteen providers across two tiers:
 
-- **Eager**: `claude`, `codex`, `copilot`, `droid`, `gemini`, `kilo-code`, `kiro`, `openclaw`, `pi`, `omp`, `qwen`, `roo-code`. Imported at module load.
+- **Eager**: `claude`, `codex`, `copilot`, `droid`, `gemini`, `ibm-bob`, `kilo-code`, `kiro`, `openclaw`, `pi`, `omp`, `qwen`, `roo-code`. Imported at module load.
 - **Lazy**: `antigravity`, `goose`, `cursor`, `opencode`, `cursor-agent`, `crush`. Imported via dynamic `import()` so the heavy dependencies (SQLite, protobuf) do not touch users who do not have those tools installed.
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
 
-`src/providers/vscode-cline-parser.ts` is a shared helper consumed by `kilo-code` and `roo-code`. It is not registered as a provider on its own.
+`src/providers/vscode-cline-parser.ts` is a shared helper consumed by `ibm-bob`, `kilo-code`, and `roo-code`. It is not registered as a provider on its own.
 
 For the per-provider data location, storage format, parser quirks, and test coverage, see `docs/providers/`.
 

@@ -13,7 +13,7 @@
     <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/sponsor-♥-ea4aaa?logo=github" alt="Sponsor" /></a>                                                  
   </p> 
 
-CodeBurn tracks token usage, cost, and performance across **18 AI coding tools**. It breaks down spending by task type, model, tool, project, and provider so you can see exactly where your budget goes.
+CodeBurn tracks token usage, cost, and performance across **19 AI coding tools**. It breaks down spending by task type, model, tool, project, and provider so you can see exactly where your budget goes.
 
 Everything runs locally. No wrapper, no proxy, no API keys. CodeBurn reads session data directly from disk and prices every call using [LiteLLM](https://github.com/BerriAI/litellm).
 
@@ -104,6 +104,7 @@ Arrow keys switch between Today, 7 Days, 30 Days, Month, and 6 Months (use `--fr
 | <img src="assets/providers/cursor-agent.jpg" width="28" /> | cursor-agent | Yes | [cursor-agent.md](docs/providers/cursor-agent.md) |
 | <img src="assets/providers/gemini.png" width="28" /> | Gemini CLI | Yes | [gemini.md](docs/providers/gemini.md) |
 | <img src="assets/providers/copilot.jpg" width="28" /> | GitHub Copilot | Yes | [copilot.md](docs/providers/copilot.md) |
+| <img src="assets/providers/ibm-bob.svg" width="28" /> | IBM Bob | Yes | [ibm-bob.md](docs/providers/ibm-bob.md) |
 | <img src="assets/providers/kiro.png" width="28" /> | Kiro | Yes | [kiro.md](docs/providers/kiro.md) |
 | <img src="assets/providers/opencode.png" width="28" /> | OpenCode | Yes | [opencode.md](docs/providers/opencode.md) |
 | <img src="assets/providers/openclaw.jpg" width="28" /> | OpenClaw | Yes | [openclaw.md](docs/providers/openclaw.md) |
@@ -119,7 +120,7 @@ Arrow keys switch between Today, 7 Days, 30 Days, Month, and 6 Months (use `--fr
 
 Each provider doc lists the exact data location, storage format, and known quirks. Linux and Windows paths are detected automatically. If a path has changed or is wrong, please [open an issue](https://github.com/getagentseal/codeburn/issues).
 
-Provider logos are trademarks of their respective owners. The icon set was sourced from [tokscale](https://github.com/junhoyeo/tokscale) (MIT) plus official vendor assets, used under nominative fair use for the purpose of identifying supported tools.
+Provider logos are trademarks of their respective owners. The icon set was sourced from [tokscale](https://github.com/junhoyeo/tokscale) (MIT), official vendor assets, and simple provider identifiers, used under nominative fair use for the purpose of identifying supported tools.
 
 CodeBurn auto-detects which AI coding tools you use. If multiple providers have session data on disk, press `p` in the dashboard to toggle between them.
 
@@ -377,6 +378,8 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 **Gemini CLI** stores sessions as single JSON files at `~/.gemini/tmp/<project>/chats/session-*.json`. Each session embeds real token counts (input, output, cached, thoughts) per message. Gemini reports input tokens inclusive of cached; CodeBurn subtracts cached from input before pricing to avoid double charging.
 
 **OpenClaw** stores agent sessions as JSONL at `~/.openclaw/agents/*.jsonl`. Also checks legacy paths `.clawdbot`, `.moltbot`, `.moldbot`. Token usage comes from assistant message `usage` blocks; model from `modelId` or `message.model` fields.
+
+**IBM Bob** stores IDE task history in `User/globalStorage/ibm.bob-code/tasks/<task-id>/` under the IBM Bob application data directory. CodeBurn reads `ui_messages.json` for API request token/cost records and `api_conversation_history.json` for the selected model, with support for both GA (`IBM Bob`) and preview (`Bob-IDE`) app data folders.
 
 **Roo Code / KiloCode** are Cline-family VS Code extensions. CodeBurn reads `ui_messages.json` from each task directory in VS Code's `globalStorage`, filtering `type: "say"` entries with `say: "api_req_started"` to extract token counts.
 

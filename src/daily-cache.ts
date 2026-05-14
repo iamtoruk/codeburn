@@ -5,24 +5,19 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 5 alongside the Cursor per-project breakdown: prior daily
-// entries recorded every Cursor session under a single 'cursor' project
-// label. After the upgrade, the breakdown produces per-workspace project
-// labels for new days; without invalidation the dashboard would show
-// 'cursor' for historical days and `-Users-you-myproject` for new ones
-// in the same window, producing a confusing mixed projection.
-export const DAILY_CACHE_VERSION = 5
-// MIN_SUPPORTED_VERSION bumped to 5 too. The migration path
+// Bumped to 6 alongside the Claude 1-hour cache-write pricing fix: prior
+// daily entries priced all Claude cache writes at the 5-minute rate, so
+// cached historical cost/model/provider/category totals would remain
+// under-reported unless discarded and recomputed from raw sessions.
+export const DAILY_CACHE_VERSION = 6
+// MIN_SUPPORTED_VERSION bumped to 6 too. The migration path
 // (isMigratableCache + migrateDays) only fills in missing default fields;
 // it does NOT recompute the providers / categories / models rollups from
 // session data, because those raw sessions are not stored in the cache.
-// So a migrated v2/v3/v4 cache would carry forward stale provider totals
-// (single 'cursor' bucket instead of per-workspace) for the full cache
-// retention window. Setting the floor to 5 forces those older caches to
-// be discarded and recomputed cleanly. Confirmed by live test:
-// menubar-json --period all reported cursor=$3.78 against a migrated
-// v4 cache but $4.08 (correct) after the cache was discarded.
-const MIN_SUPPORTED_VERSION = 5
+// So a migrated v5 cache would carry forward stale pricing totals for
+// the full cache retention window. Setting the floor to 6 forces older
+// caches to be discarded and recomputed cleanly.
+const MIN_SUPPORTED_VERSION = 6
 const DAILY_CACHE_FILENAME = 'daily-cache.json'
 
 export type DailyEntry = {

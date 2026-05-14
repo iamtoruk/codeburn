@@ -25,6 +25,7 @@ type SnapshotEntry = [number, number, number | null, number | null]
 const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const WEB_SEARCH_COST = 0.01
+const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
 
 const FAST_MULTIPLIERS: Record<string, number> = {
   'claude-opus-4-7': 6,
@@ -166,6 +167,7 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'copilot-auto':                  'claude-sonnet-4-5',
   'copilot-openai-auto':           'gpt-5.3-codex',
   'copilot-anthropic-auto':        'claude-sonnet-4-5',
+  'ibm-bob-auto':                  'claude-sonnet-4-5',
   'kiro-auto':                     'claude-sonnet-4-5',
   'cline-auto':                    'claude-sonnet-4-5',
   'openclaw-auto':                 'claude-sonnet-4-5',
@@ -310,6 +312,7 @@ export function calculateCost(
   cacheReadTokens: number,
   webSearchRequests: number,
   speed: 'standard' | 'fast' = 'standard',
+  oneHourCacheCreationTokens = 0,
 ): number {
   const costs = getModelCosts(model)
   if (!costs) {
@@ -335,11 +338,15 @@ export function calculateCost(
   // from real spend in aggregate totals. NaN is also handled here; the
   // arithmetic below short-circuits to 0 when any operand is non-finite.
   const safe = (n: number) => (Number.isFinite(n) && n > 0 ? n : 0)
+  const safeOneHourCacheCreation = safe(oneHourCacheCreationTokens)
+  const safeCacheCreation = Math.max(safe(cacheCreationTokens), safeOneHourCacheCreation)
+  const safeFiveMinuteCacheCreation = Math.max(0, safeCacheCreation - safeOneHourCacheCreation)
 
   return multiplier * (
     safe(inputTokens) * costs.inputCostPerToken +
     safe(outputTokens) * costs.outputCostPerToken +
-    safe(cacheCreationTokens) * costs.cacheWriteCostPerToken +
+    safeFiveMinuteCacheCreation * costs.cacheWriteCostPerToken +
+    safeOneHourCacheCreation * costs.cacheWriteCostPerToken * ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE +
     safe(cacheReadTokens) * costs.cacheReadCostPerToken +
     safe(webSearchRequests) * costs.webSearchCostPerRequest
   )
@@ -351,6 +358,7 @@ const autoModelNames: Record<string, string> = {
   'copilot-auto': 'Copilot (auto)',
   'copilot-openai-auto': 'Copilot (OpenAI)',
   'copilot-anthropic-auto': 'Copilot (Anthropic)',
+  'ibm-bob-auto': 'IBM Bob (auto)',
   'kiro-auto': 'Kiro (auto)',
   'cline-auto': 'Cline (auto)',
   'openclaw-auto': 'OpenClaw (auto)',

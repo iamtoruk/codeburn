@@ -93,16 +93,39 @@ function getMessageId(entry: JournalEntry): string | null {
   return msg?.id ?? null
 }
 
+function positiveNumber(n: number | undefined): number {
+  return n !== undefined && Number.isFinite(n) && n > 0 ? n : 0
+}
+
+function extractClaudeCacheCreation(usage: AssistantMessageContent['usage']): { totalTokens: number; oneHourTokens: number } {
+  const legacyTotal = positiveNumber(usage.cache_creation_input_tokens)
+  const cacheCreation = usage.cache_creation
+  const fiveMinuteTokens = positiveNumber(cacheCreation?.ephemeral_5m_input_tokens)
+  const oneHourTokens = positiveNumber(cacheCreation?.ephemeral_1h_input_tokens)
+  const splitTotal = fiveMinuteTokens + oneHourTokens
+
+  if (splitTotal === 0) return { totalTokens: legacyTotal, oneHourTokens: 0 }
+
+  // Valid Claude usage reports the legacy total and split total as equal.
+  // Keep the larger value so malformed partial splits do not drop tokens.
+  const totalTokens = Math.max(legacyTotal, splitTotal)
+  return {
+    totalTokens,
+    oneHourTokens: Math.min(oneHourTokens, totalTokens),
+  }
+}
+
 function parseApiCall(entry: JournalEntry): ParsedApiCall | null {
   if (entry.type !== 'assistant') return null
   const msg = entry.message as AssistantMessageContent | undefined
   if (!msg?.usage || !msg?.model) return null
 
   const usage = msg.usage
+  const cacheCreation = extractClaudeCacheCreation(usage)
   const tokens: TokenUsage = {
     inputTokens: usage.input_tokens ?? 0,
     outputTokens: usage.output_tokens ?? 0,
-    cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+    cacheCreationInputTokens: cacheCreation.totalTokens,
     cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
     cachedInputTokens: 0,
     reasoningTokens: 0,
@@ -119,6 +142,7 @@ function parseApiCall(entry: JournalEntry): ParsedApiCall | null {
     tokens.cacheReadInputTokens,
     tokens.webSearchRequests,
     usage.speed ?? 'standard',
+    cacheCreation.oneHourTokens,
   )
 
   const bashCmds = extractBashCommandsFromContent(msg.content ?? [])
@@ -564,7 +588,7 @@ async function parseProviderSources(
   const provider = await getProvider(providerName)
   if (!provider) return []
 
-  const sessionMap = new Map<string, { project: string; turns: ClassifiedTurn[] }>()
+  const sessionMap = new Map<string, { project: string; projectPath?: string; turns: ClassifiedTurn[] }>()
 
   try {
     for (const source of sources) {
@@ -589,13 +613,15 @@ async function parseProviderSources(
 
           const turn = providerCallToTurn(call)
           const classified = classifyTurn(turn)
-          const key = `${providerName}:${call.sessionId}:${source.project}`
+          const project = call.project ?? source.project
+          const key = `${providerName}:${call.sessionId}:${project}`
 
           const existing = sessionMap.get(key)
           if (existing) {
             existing.turns.push(classified)
+            if (!existing.projectPath && call.projectPath) existing.projectPath = call.projectPath
           } else {
-            sessionMap.set(key, { project: source.project, turns: [classified] })
+            sessionMap.set(key, { project, projectPath: call.projectPath, turns: [classified] })
           }
         }
       } catch (err) {
@@ -614,22 +640,26 @@ async function parseProviderSources(
     }
   }
 
-  const projectMap = new Map<string, SessionSummary[]>()
-  for (const [key, { project, turns }] of sessionMap) {
+  const projectMap = new Map<string, { projectPath?: string; sessions: SessionSummary[] }>()
+  for (const [key, { project, projectPath, turns }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
     const session = buildSessionSummary(sessionId, project, turns)
     if (session.apiCalls > 0) {
-      const existing = projectMap.get(project) ?? []
-      existing.push(session)
-      projectMap.set(project, existing)
+      const existing = projectMap.get(project)
+      if (existing) {
+        existing.sessions.push(session)
+        if (!existing.projectPath && projectPath) existing.projectPath = projectPath
+      } else {
+        projectMap.set(project, { projectPath, sessions: [session] })
+      }
     }
   }
 
   const projects: ProjectSummary[] = []
-  for (const [dirName, sessions] of projectMap) {
+  for (const [dirName, { projectPath, sessions }] of projectMap) {
     projects.push({
       project: dirName,
-      projectPath: unsanitizePath(dirName),
+      projectPath: projectPath ?? unsanitizePath(dirName),
       sessions,
       totalCostUSD: sessions.reduce((s, sess) => s + sess.totalCostUSD, 0),
       totalApiCalls: sessions.reduce((s, sess) => s + sess.apiCalls, 0),

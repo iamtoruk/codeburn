@@ -64,6 +64,25 @@ const toolNameMap: Record<string, string> = {
   patch: 'Patch',
 }
 
+function normalizeToolName(rawTool?: string): string {
+  if (!rawTool) return ''
+  if (rawTool.startsWith('mcp__')) return rawTool
+
+  const builtIn = toolNameMap[rawTool]
+  if (builtIn) return builtIn
+
+  // OpenCode stores MCP calls as `<server>_<tool>` with no separate server field.
+  // Built-ins are handled above, and server ids are assumed not to contain `_`.
+  const serverSeparator = rawTool.indexOf('_')
+  if (serverSeparator > 0 && serverSeparator < rawTool.length - 1) {
+    const server = rawTool.slice(0, serverSeparator)
+    const tool = rawTool.slice(serverSeparator + 1)
+    return `mcp__${server}__${tool}`
+  }
+
+  return rawTool
+}
+
 function sanitize(dir: string): string {
   return dir.replace(/^\//, '').replace(/\//g, '-')
 }
@@ -233,7 +252,7 @@ function createParser(
           const msgParts = partsByMsg.get(msg.id) ?? []
           const toolParts = msgParts.filter((p) => p.type === 'tool')
           const tools = toolParts
-            .map((p) => toolNameMap[p.tool ?? ''] ?? p.tool ?? '')
+            .map((p) => normalizeToolName(p.tool))
             .filter(Boolean)
 
           const bashCommands = toolParts

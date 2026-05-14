@@ -337,6 +337,124 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     expect(call.deduplicationKey).toBe('opencode:sess-1:msg-2')
   })
 
+  it('normalizes opencode MCP tool names for shared MCP reporting', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+
+      insertMessage(db, 'msg-1', 'sess-1', 1700000000000, { role: 'user' })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', { type: 'text', text: 'look up the ClickUp task' })
+
+      insertMessage(db, 'msg-2', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-2', 'msg-2', 'sess-1', {
+        type: 'tool',
+        tool: 'clickup_clickup_get_task',
+        state: { status: 'completed', input: {} },
+      })
+      insertPart(db, 'part-3', 'msg-2', 'sess-1', {
+        type: 'tool',
+        tool: 'figma_get_file',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual([
+      'mcp__clickup__clickup_get_task',
+      'mcp__figma__get_file',
+    ])
+  })
+
+  it('preserves already-normalized MCP tool names', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: 'mcp__github__search_code',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['mcp__github__search_code'])
+  })
+
+  it('keeps extension tool names without a server prefix as regular tools', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: 'customtool',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['customtool'])
+  })
+
+  it('keeps malformed server-prefixed tool names as regular tools', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: '_missing_server',
+        state: { status: 'completed', input: {} },
+      })
+      insertPart(db, 'part-2', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: 'missing_',
+        state: { status: 'completed', input: {} },
+      })
+      insertPart(db, 'part-3', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: '_',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual([
+      '_missing_server',
+      'missing_',
+      '_',
+    ])
+  })
+
   it('skips zero-token messages with zero cost', async () => {
     const dbPath = createTestDb(tmpDir)
     withTestDb(dbPath, (db) => {

@@ -15,6 +15,7 @@ For the architectural picture, see `../architecture.md`.
 | [Copilot](copilot.md) | JSONL | `src/providers/copilot.ts` | `tests/providers/copilot.test.ts` |
 | [Droid](droid.md) | JSONL | `src/providers/droid.ts` | `tests/providers/droid.test.ts` |
 | [Gemini](gemini.md) | JSON / JSONL | `src/providers/gemini.ts` | none |
+| [IBM Bob](ibm-bob.md) | JSON | `src/providers/ibm-bob.ts` | `tests/providers/ibm-bob.test.ts` |
 | [KiloCode](kilo-code.md) | JSON | `src/providers/kilo-code.ts` | `tests/providers/kilo-code.test.ts` |
 | [Kiro](kiro.md) | JSON | `src/providers/kiro.ts` | `tests/providers/kiro.test.ts` |
 | [OpenClaw](openclaw.md) | JSONL | `src/providers/openclaw.ts` | `tests/providers/openclaw.test.ts` |
@@ -38,7 +39,7 @@ For the architectural picture, see `../architecture.md`.
 
 | Helper | Used by | Source |
 |---|---|---|
-| [vscode-cline-parser](vscode-cline-parser.md) | `kilo-code`, `roo-code` | `src/providers/vscode-cline-parser.ts` |
+| [vscode-cline-parser](vscode-cline-parser.md) | `ibm-bob`, `kilo-code`, `roo-code` | `src/providers/vscode-cline-parser.ts` |
 
 ## File Format
 
