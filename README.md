@@ -380,6 +380,8 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 
 **Pi / OMP** stores sessions as JSONL at `~/.pi/agent/sessions/<sanitized-cwd>/*.jsonl` (Pi) and `~/.omp/agent/sessions/<sanitized-cwd>/*.jsonl` (OMP). Each assistant message carries token usage (input, output, cacheRead, cacheWrite) plus inline `toolCall` content blocks. CodeBurn extracts token counts, normalizes tool names to the standard set (`bash` to `Bash`, `dispatch_agent` to `Agent`), and pulls bash commands from `toolCall.arguments.command` for the shell breakdown.
 
+**Codebuff** (formerly Manicode) stores per-chat history as JSON at `~/.config/manicode/projects/<project>/chats/<chatId>/chat-messages.json`. Codebuff bills in credits rather than tokens, so CodeBurn records each completed assistant message (via `msg.credits`) and approximates cost at the public pay-as-you-go rate ($0.01 / credit). When Codebuff routes a call through an upstream provider and the stashed RunState records token-level usage (`message.metadata.runState.sessionState.mainAgentState.messageHistory[*].providerOptions`), the real tokens and LiteLLM-calculated cost take precedence. Codebuff-native tool names (`read_files`, `str_replace`, `run_terminal_command`, `spawn_agents`, etc.) normalize to the canonical set (`Read`, `Edit`, `Bash`, `Agent`). The `manicode-dev` and `manicode-staging` channels are walked automatically when present. Honors `CODEBUFF_DATA_DIR` for a custom root.
+
 **Gemini CLI** stores sessions as single JSON files at `~/.gemini/tmp/<project>/chats/session-*.json`. Each session embeds real token counts (input, output, cached, thoughts) per message. Gemini reports input tokens inclusive of cached; CodeBurn subtracts cached from input before pricing to avoid double charging.
 
 **Mistral Vibe** stores session folders at `~/.vibe/logs/session/`. Each folder contains `meta.json` with cumulative prompt/completion token totals, model pricing, timestamps, and working directory, plus `messages.jsonl` with user prompts and assistant tool calls. CodeBurn emits one record per Vibe session because the source data is cumulative, not per assistant turn.
@@ -392,7 +394,7 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 
 **Kimi Code CLI** stores session logs under `$KIMI_SHARE_DIR/sessions/<workdir-hash>/<session-id>/` or `~/.kimi/sessions/<workdir-hash>/<session-id>/`. CodeBurn reads `wire.jsonl` `StatusUpdate.token_usage` records, maps `input_other`, `input_cache_read`, `input_cache_creation`, and `output` into the standard token columns, and includes subagent sessions under each session's `subagents/` folder.
 
-CodeBurn deduplicates messages (by API message ID for Claude, by cumulative token cross-check for Codex, by conversation/timestamp for Cursor, by session ID for Gemini, by session+message ID for OpenCode, by responseId for Pi/OMP, by session+message ID for Kimi), filters by date range per entry, and classifies each turn.
+CodeBurn deduplicates messages (by API message ID for Claude, by cumulative token cross-check for Codex, by conversation/timestamp for Cursor, by session ID for Gemini, by session+message ID for OpenCode, by responseId for Pi/OMP, by chat folder + message ID for Codebuff, by session+message ID for Kimi), filters by date range per entry, and classifies each turn.
 
 ## Environment Variables
 
@@ -401,6 +403,7 @@ CodeBurn deduplicates messages (by API message ID for Claude, by cumulative toke
 | `CLAUDE_CONFIG_DIR` | Override Claude Code data directory (default: `~/.claude`) |
 | `CLAUDE_CONFIG_DIRS` | OS-delimited list of Claude data directories to scan together (e.g. `~/.claude-work:~/.claude-personal`). Sessions merge into one row per project. Overrides `CLAUDE_CONFIG_DIR` when set. |
 | `CODEX_HOME` | Override Codex data directory (default: `~/.codex`) |
+| `CODEBUFF_DATA_DIR` | Override Codebuff data directory (default: `~/.config/manicode`) |
 | `FACTORY_DIR` | Override Droid data directory (default: `~/.factory`) |
 | `KIMI_SHARE_DIR` | Override Kimi Code CLI share directory (default: `~/.kimi`) |
 | `KIMI_MODEL_NAME` | Override Kimi model name when Kimi sessions do not record the model |
