@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added (CLI)
+- **MCP and skill reliability report.** `codeburn optimize` now detects MCP
+  servers and skills whose edit turns are disproportionately retry-heavy,
+  using turn-level MCP/Skill call evidence and a shared-turn token estimate so
+  one retry-heavy turn is not double-counted across multiple capabilities.
+  Thanks @ozymandiashh. (#357)
 - **Tooling breakdowns in dashboard and menubar.** New panels showing core
   tools, MCP servers, and shell command usage per session and across periods.
 - **File-aware retry detection with typed ToolCall.** One-shot rate now tracks
