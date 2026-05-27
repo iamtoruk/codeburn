@@ -59,6 +59,18 @@ struct MenuBarContent: View {
                     } else {
                         BurnLoadingOverlay(periodLabel: store.selectionLabel)
                             .transition(.opacity)
+                            .task {
+                                // Keep retrying until data loads or the view is removed.
+                                // The original one-shot recovery silently gave up if the
+                                // first attempt also stalled (generation mismatch, CLI
+                                // timeout, day rollover race). Looping guarantees the
+                                // user never sees a permanent spinner.
+                                while !Task.isCancelled {
+                                    try? await Task.sleep(for: .seconds(8))
+                                    guard !Task.isCancelled, !store.hasCachedData else { return }
+                                    await store.recoverFromStuckLoading()
+                                }
+                            }
                     }
                 }
             }

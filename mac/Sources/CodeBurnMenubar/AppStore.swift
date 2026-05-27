@@ -307,7 +307,7 @@ final class AppStore {
         }
     }
 
-    private var inFlightKeys: Set<PayloadCacheKey> = []
+    private var inFlightKeys: [PayloadCacheKey: Date] = [:]
 
     func resetLoadingState() {
         payloadRefreshGeneration &+= 1
@@ -333,21 +333,29 @@ final class AppStore {
     @discardableResult
     func clearStaleLoadingIfNeeded() -> Bool {
         let now = Date()
-        let staleEntries = loadingStartedAtByKey.filter {
+        let staleLoading = loadingStartedAtByKey.filter {
             now.timeIntervalSince($0.value) > loadingWatchdogSeconds
         }
-        guard !staleEntries.isEmpty else { return false }
+        let staleInFlight = inFlightKeys.filter { (key, insertedAt) in
+            now.timeIntervalSince(insertedAt) > loadingWatchdogSeconds &&
+            loadingStartedAtByKey[key] == nil
+        }
+        guard !staleLoading.isEmpty || !staleInFlight.isEmpty else { return false }
 
-        payloadRefreshGeneration &+= 1
-        for (key, started) in staleEntries {
+        for (key, started) in staleLoading {
             NSLog("CodeBurn: loading stuck for %ds on %@/%@ — auto-clearing",
                   Int(now.timeIntervalSince(started)), key.label, key.provider.rawValue)
             loadingCountsByKey[key] = nil
             loadingStartedAtByKey[key] = nil
-            inFlightKeys.remove(key)
+            inFlightKeys[key] = nil
             if cache[key] == nil {
                 lastErrorByKey[key] = "Refresh took longer than expected. CodeBurn will keep retrying in the background."
             }
+        }
+        for (key, insertedAt) in staleInFlight {
+            NSLog("CodeBurn: orphaned in-flight key stuck for %ds on %@/%@ — clearing",
+                  Int(now.timeIntervalSince(insertedAt)), key.label, key.provider.rawValue)
+            inFlightKeys[key] = nil
         }
         return true
     }
@@ -394,6 +402,11 @@ final class AppStore {
         cache.removeAll()
     }
 
+    func recoverFromStuckLoading() async {
+        resetLoadingState()
+        await refresh(key: currentKey, includeOptimize: false, force: true, showLoading: true)
+    }
+
     func refresh(includeOptimize: Bool, force: Bool = false, showLoading: Bool = false) async {
         await refresh(key: currentKey, includeOptimize: includeOptimize, force: force, showLoading: showLoading)
     }
@@ -404,8 +417,8 @@ final class AppStore {
         let generationAtStart = payloadRefreshGeneration
         if Task.isCancelled { return }
         if !force, cache[key]?.isFresh == true { return }
-        if inFlightKeys.contains(key) { return }
-        inFlightKeys.insert(key)
+        if inFlightKeys[key] != nil { return }
+        inFlightKeys[key] = Date()
         attemptedKeys.insert(key)
         lastErrorByKey[key] = nil
         let didShowLoading = showLoading || cache[key] == nil
@@ -425,7 +438,7 @@ final class AppStore {
         }
         defer {
             let abandonedAttempt = Task.isCancelled || generationAtStart != payloadRefreshGeneration
-            inFlightKeys.remove(key)
+            inFlightKeys[key] = nil
             if didShowLoading {
                 finishLoading(for: key)
             }
@@ -496,8 +509,8 @@ final class AppStore {
         invalidateStaleDayCache()
         let key = PayloadCacheKey(period: period, provider: .all, day: day)
         if !force, cache[key]?.isFresh == true { return }
-        if inFlightKeys.contains(key) { return }
-        inFlightKeys.insert(key)
+        if inFlightKeys[key] != nil { return }
+        inFlightKeys[key] = Date()
         attemptedKeys.insert(key)
         let cacheDateAtStart = cacheDate
         let generationAtStart = payloadRefreshGeneration
@@ -505,7 +518,7 @@ final class AppStore {
             NSLog("CodeBurn: refreshing stale today status payload after %ds", age)
         }
         defer {
-            inFlightKeys.remove(key)
+            inFlightKeys[key] = nil
         }
         do {
             let fresh = try await DataClient.fetch(period: period, day: day, provider: .all, includeOptimize: false)
