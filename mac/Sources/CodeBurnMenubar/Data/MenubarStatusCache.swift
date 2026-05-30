@@ -40,4 +40,20 @@ struct MenubarStatusCache {
         }
         return BadgeRead(payload: payload, ageSeconds: age)
     }
+
+    // Interpolated values are app-controlled: argv via CodeburnCLI.scriptEnvironment
+    // (isSafe-validated) and period via the Period enum's fixed cliArg set.
+    func writeRefreshScript(period: Period) throws {
+        let env = CodeburnCLI.scriptEnvironment()
+        let binCommand = env.argv.joined(separator: " ")
+        let tmpPath = statusPath + ".tmp"
+        let body = """
+        #!/bin/sh
+        export PATH="\(env.path)"
+        TMP="\(tmpPath)"
+        OUT="\(statusPath)"
+        \(binCommand) status --format menubar-json --provider all --period \(period.cliArg) --no-optimize > "$TMP" 2>/dev/null && mv -f "$TMP" "$OUT" || rm -f "$TMP"
+        """
+        try SafeFile.write(Data(body.utf8), to: scriptPath, mode: 0o700)
+    }
 }
