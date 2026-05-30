@@ -119,4 +119,22 @@ struct AppStoreRefreshRecoveryTests {
         #expect(store.isInFlightForTesting(period: .today, provider: .all))
     }
 
+    @Test("prepareStuckLoadingRecovery clears stale loading bookkeeping for the current key")
+    func popoverRecoveryClearsStuckLoading() {
+        let store = AppStore()
+        // Seed an orphaned in-flight entry older than the 60s watchdog so the
+        // stale-clear path runs, mimicking a fetch torn down across sleep/wake.
+        store.seedInFlightForTesting(
+            period: .today,
+            provider: .all,
+            insertedAt: Date().addingTimeInterval(-120)
+        )
+        #expect(store.isInFlightForTesting(period: .today, provider: .all))
+
+        let willFetch = store.prepareStuckLoadingRecovery()
+
+        #expect(willFetch)
+        #expect(!store.isInFlightForTesting(period: .today, provider: .all))
+    }
+
 }

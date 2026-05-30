@@ -512,15 +512,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func refreshPayloadForPopoverOpen() {
-        guard store.needsInteractivePayloadRefresh else { return }
-        let shouldResetPipeline = store.shouldResetInteractiveRefreshPipeline
-        if shouldResetPipeline, let age = store.staleInteractivePayloadAgeSeconds {
-            NSLog("CodeBurn: popover opened with %ds stale payload cache - resetting refresh pipeline", age)
+        // A user viewing the popover is ground truth and must always recover.
+        // Unconditionally ensure the loop is alive, then clear the current
+        // key's stuck loading / in-flight / generation bookkeeping and force a
+        // fresh fetch — even if the cache looks "not stale yet". This is the
+        // guaranteed one-round-trip recovery path.
+        if refreshTimer == nil {
+            startRefreshLoop(forceQuotaOnStart: false)
         }
-        recoverRefreshPipelineAfterInterruption(
-            resetLoading: shouldResetPipeline,
-            reason: "popover open"
-        )
+        if store.shouldResetInteractiveRefreshPipeline,
+           let age = store.staleInteractivePayloadAgeSeconds {
+            NSLog("CodeBurn: popover opened with %ds stale payload cache - hard recovery", age)
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.store.recoverFromStuckLoading()
+            self.refreshStatusButton()
+        }
     }
 
     private func stopRefreshTimer() {
