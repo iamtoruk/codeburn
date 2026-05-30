@@ -213,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let home = fm.homeDirectoryForCurrentUser.path
         let destPath = "\(home)/Library/LaunchAgents/\(agentName)"
 
+        let scriptPath = "\(home)/.cache/codeburn/menubar-refresh.sh"
         let plist = """
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -222,11 +223,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     <string>com.codeburn.refresh</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/osascript</string>
-        <string>-l</string>
-        <string>JavaScript</string>
-        <string>-e</string>
-        <string>ObjC.import("Foundation"); $.NSDistributedNotificationCenter.defaultCenter.postNotificationNameObjectUserInfoDeliverImmediately("com.codeburn.refresh", $(), $(), true)</string>
+        <string>/bin/sh</string>
+        <string>\(scriptPath)</string>
     </array>
     <key>StartInterval</key>
     <integer>30</integer>
