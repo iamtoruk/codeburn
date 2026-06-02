@@ -49,7 +49,7 @@ struct DataClient {
         }
     }
 
-    private struct ProcessResult {
+    struct ProcessResult {
         let stdout: Data
         let stderr: String
         let exitCode: Int32
@@ -57,7 +57,26 @@ struct DataClient {
 
     private static func runCLI(subcommand: [String]) async throws -> ProcessResult {
         let process = CodeburnCLI.makeProcess(subcommand: subcommand)
+        return try await runProcess(process,
+                                    timeoutSeconds: spawnTimeoutSeconds,
+                                    label: subcommand.joined(separator: " "))
+    }
 
+    /// Runs an already-configured process to completion, draining its output and
+    /// enforcing a hard timeout.
+    ///
+    /// CRITICAL: neither the timeout nor the exit wait may run on Swift's
+    /// cooperative thread pool. `process.waitUntilExit()` is a blocking syscall;
+    /// on a 16-core machine, 16 concurrent slow CLIs would pin all 16 cooperative
+    /// threads inside waitUntilExit, exhausting the pool. A timeout living on that
+    /// same pool could then never be scheduled to kill the hung processes — the
+    /// menubar deadlocks on "Loading…" forever (confirmed via sample: 16/16
+    /// cooperative threads parked in waitUntilExit). So the timeout is a
+    /// DispatchSource on a global queue, and the exit wait is bridged through a
+    /// global (overcommit) queue instead of blocking the caller's executor.
+    static func runProcess(_ process: Process,
+                           timeoutSeconds: UInt64,
+                           label: String) async throws -> ProcessResult {
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe
@@ -69,15 +88,17 @@ struct DataClient {
             throw DataClientError.spawn(error.localizedDescription)
         }
 
-        let timeoutTask = Task.detached(priority: .utility) {
-            try? await Task.sleep(nanoseconds: spawnTimeoutSeconds * 1_000_000_000)
+        let timeoutTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timeoutTimer.schedule(deadline: .now() + .seconds(Int(timeoutSeconds)))
+        timeoutTimer.setEventHandler {
             if process.isRunning {
                 NSLog("CodeBurn: CLI subprocess timed out after %llus for %@ — terminating",
-                      spawnTimeoutSeconds, subcommand.joined(separator: " "))
+                      timeoutSeconds, label)
                 terminateWithEscalation(process)
             }
         }
-        defer { timeoutTask.cancel() }
+        timeoutTimer.resume()
+        defer { timeoutTimer.cancel() }
 
         let outHandle = outPipe.fileHandleForReading
         let errHandle = errPipe.fileHandleForReading
@@ -90,7 +111,12 @@ struct DataClient {
         }
         try? outHandle.close()
         try? errHandle.close()
-        process.waitUntilExit()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                process.waitUntilExit()
+                continuation.resume()
+            }
+        }
 
         if out.count >= maxPayloadBytes {
             throw DataClientError.outputTooLarge
