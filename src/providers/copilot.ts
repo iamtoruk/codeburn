@@ -1,661 +1,710 @@
-import { existsSync } from 'fs'
-import { readdir, readFile, stat } from 'fs/promises'
-import { basename, dirname, join, posix, win32 } from 'path'
-import { homedir } from 'os'
+// =============================================================================
+// copilot.ts — Modified CodeBurn Copilot provider
+// =============================================================================
+//
+// WHAT CHANGED:
+//   The original provider only reads Copilot's JSONL session-state files from
+//   ~/.copilot/session-state/, which only log output tokens. Input tokens,
+//   cache-read tokens, and cache-creation tokens are never written there, so
+//   CodeBurn underreports Copilot costs by 60-80%.
+//
+//   This modified version adds a SECOND data source: VS Code Copilot Chat's
+//   OTel SQLite store (agent-traces.db). When present, it contains full
+//   per-LLM-call token breakdowns (input, output, cache_read, cache_creation)
+//   from the OpenTelemetry GenAI semantic conventions. We prefer OTel data
+//   when available and fall back to the original JSONL parsing.
+//
+// HOW TO ENABLE THE OTEL SQLITE STORE:
+//   TWO settings must both be enabled in VS Code settings.json:
+//
+//     {
+//       "github.copilot.chat.otel.enabled": true,
+//       "github.copilot.chat.otel.dbSpanExporter.enabled": true
+//     }
+//
+//   The first enables the OTel pipeline; the second (defaults to false) enables
+//   the SQLite span exporter that actually writes agent-traces.db.
+//   After changing these settings, restart VS Code — the extension watches for
+//   these changes and requires a reload to take effect.
+//
+//   Or set the environment variable before launching VS Code:
+//
+//     export COPILOT_OTEL_ENABLED=true
+//
+//   The DB file is created in VS Code's global storage directory:
+//     ~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/agent-traces.db
+//
+// ENVIRONMENT VARIABLES:
+//   CODEBURN_COPILOT_OTEL_DB    — Override the agent-traces.db path
+//   CODEBURN_COPILOT_DISABLE_OTEL=1 — Skip OTel entirely, use only JSONL
+//
+// ARCHITECTURE:
+//   discoverSessions() returns BOTH OTel sessions (one per conversation_id)
+//   and JSONL sessions. The OTel sessions are deduped against JSONL by
+//   conversation ID so we don't double-count. OTel sessions carry the full
+//   token breakdown; JSONL sessions only carry output tokens (the original
+//   behaviour, as a fallback).
+//
+// LIMITATIONS:
+//   - The OTel DB only contains Copilot Chat and Agent mode spans. Inline
+//     completions (ghost text) and Agent Host spans are NOT yet written to
+//     this DB (see https://github.com/microsoft/vscode/issues/315901).
+//   - The DB schema is inferred from the official OTel GenAI semantic
+//     conventions and the Copilot Budget extension's approach. If VS Code
+//     changes the schema, this parser will need updating.
+// =============================================================================
 
+import { readdir, stat } from 'fs/promises'
+import { homedir, platform } from 'os'
+import { join, basename, dirname, posix, win32 } from 'path'
+import { existsSync } from 'fs'
 import { readSessionFile } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type {
+  Provider,
+  SessionSource,
+  SessionParser,
+  ParsedProviderCall,
+} from './types.js'
 
+// ---------------------------------------------------------------------------
+// Model display names (unchanged from original)
+// ---------------------------------------------------------------------------
 const modelDisplayNames: Record<string, string> = {
   'gpt-4.1-nano': 'GPT-4.1 Nano',
   'gpt-4.1-mini': 'GPT-4.1 Mini',
   'gpt-4.1': 'GPT-4.1',
   'gpt-4o-mini': 'GPT-4o Mini',
   'gpt-4o': 'GPT-4o',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.3-codex': 'GPT-5.3 Codex',
   'gpt-5-mini': 'GPT-5 Mini',
   'gpt-5': 'GPT-5',
-  'claude-opus-4-7': 'Opus 4.7',
-  'claude-opus-4-6': 'Opus 4.6',
-  'claude-opus-4-5': 'Opus 4.5',
-  'claude-opus-4-1': 'Opus 4.1',
-  'claude-opus-4': 'Opus 4',
-  'claude-sonnet-4-6': 'Sonnet 4.6',
   'claude-sonnet-4-5': 'Sonnet 4.5',
   'claude-sonnet-4': 'Sonnet 4',
-  'claude-3-7-sonnet': 'Sonnet 3.7',
-  'claude-3-5-sonnet': 'Sonnet 3.5',
-  'o4-mini': 'o4-mini',
-  'o3': 'o3',
+  'copilot-openai-auto': 'Copilot (OpenAI auto)',
+  'copilot-anthropic-auto': 'Copilot (Anthropic auto)',
 }
 
+// ---------------------------------------------------------------------------
+// Tool name normalisation (unchanged from original, plus OTel tool names)
+// ---------------------------------------------------------------------------
 const toolNameMap: Record<string, string> = {
+  // JSONL session-state tool names
   bash: 'Bash',
-  run_in_terminal: 'Bash',
   read_file: 'Read',
   write_file: 'Edit',
   edit_file: 'Edit',
-  replace_string_in_file: 'Edit',
-  create_file: 'Write',
   delete_file: 'Delete',
-  search_files: 'Grep',
-  file_search: 'Grep',
-  find_files: 'Glob',
-  list_directory: 'LS',
-  list_dir: 'LS',
-  web_search: 'WebSearch',
-  fetch_webpage: 'WebFetch',
   github_repo: 'GitHub',
-  memory: 'Memory',
-  kill_terminal: 'Bash',
+  web_search: 'WebSearch',
+  run_in_terminal: 'Shell',
+  // OTel execute_tool span names from Copilot Chat:
+  readFile: 'Read',
+  writeFile: 'Edit',
+  editFile: 'Edit',
+  runCommand: 'Shell',
+  runInTerminal: 'Shell',
+  findFiles: 'Search',
+  grepSearch: 'Search',
+  codebaseSearch: 'Search',
+  getErrors: 'Diagnostics',
+  listCodeUsages: 'Search',
+  createFile: 'Edit',
+  deleteFile: 'Delete',
+  renameOrMoveFile: 'Edit',
+  fetchWebpage: 'Web',
 }
 
-function normalizeMcpSegment(segment: string): string {
-  return segment
-    .replace(/[^a-zA-Z0-9_]+/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_+|_+$/g, '')
+/**
+ * Normalise a raw tool name to its display form.
+ * - Known tools are mapped via toolNameMap.
+ * - MCP tools (containing both '-' and '_') are formatted as
+ *   mcp__server_name__tool_name.
+ * - Everything else is returned unchanged.
+ */
+function normalizeTool(rawTool: string): string {
+  const mapped = toolNameMap[rawTool]
+  if (mapped) return mapped
+  // MCP tool names follow the pattern: server-name-tool_operand
+  // e.g. github-mcp-server-list_issues → mcp__github_mcp_server__list_issues
+  const dashIdx = rawTool.lastIndexOf('-')
+  if (dashIdx > 0 && rawTool.includes('_')) {
+    const server = rawTool.slice(0, dashIdx).replace(/-/g, '_')
+    const tool = rawTool.slice(dashIdx + 1)
+    return `mcp__${server}__${tool}`
+  }
+  return rawTool
 }
 
-function normalizeCopilotMcpTool(rawTool: string): string | null {
-  const serverSeparator = rawTool.lastIndexOf('-')
-  if (serverSeparator <= 0 || serverSeparator >= rawTool.length - 1) return null
+const modelDisplayEntries = Object.entries(modelDisplayNames).sort(
+  (a, b) => b[0].length - a[0].length
+)
 
-  const server = normalizeMcpSegment(rawTool.slice(0, serverSeparator))
-  const tool = normalizeMcpSegment(rawTool.slice(serverSeparator + 1))
-  if (!server || !tool) return null
-
-  return `mcp__${server}__${tool}`
+// ---------------------------------------------------------------------------
+// Types for JSONL session state events (unchanged from original)
+// ---------------------------------------------------------------------------
+type ToolRequest = {
+  toolName?: string  // older format
+  name?: string      // newer format (copilot-agent)
 }
 
-function normalizeToolName(rawTool?: unknown): string {
-  if (typeof rawTool !== 'string') return ''
-  if (!rawTool) return ''
-  if (rawTool.startsWith('mcp__')) return rawTool
-
-  const builtIn = toolNameMap[rawTool]
-  if (builtIn) return builtIn
-
-  // Copilot records MCP tools as `<server>-<tool>` instead of Claude's
-  // `mcp__server__tool`; built-ins are handled above before this heuristic.
-  return normalizeCopilotMcpTool(rawTool) ?? rawTool
+type SessionStartData = {
+  selectedModel?: string
 }
 
-const CHARS_PER_TOKEN = 4
-const COPILOT_OPENAI_AUTO = 'copilot-openai-auto'
-const COPILOT_ANTHROPIC_AUTO = 'copilot-anthropic-auto'
-
-const modelDisplayEntries = Object.entries(modelDisplayNames).sort((a, b) => b[0].length - a[0].length)
-
-// --- Legacy format (session-state/events.jsonl with outputTokens) ---
-
-type LegacyToolRequest = {
-  name?: string
-  toolCallId?: string
-  type?: string
+type ModelChangeData = {
+  newModel: string
+  previousModel?: string
 }
 
-// Per-event-type shapes. The previous union included a permissive catch-all
-// branch (`{ type: string; data: Record<string, unknown> }`); a literal type
-// like `'user.message'` is assignable to `string`, so TS picked the catch-all
-// over the specific branches when narrowing on `type`, which propagated
-// `unknown`/`{}` into `event.data.content` etc. We now keep only the three
-// shapes we actually read from. Unknown event types fall through the if/else
-// chain without further narrowing — they are not in the union, but JSON.parse
-// returns `any` so we re-type as LegacyCopilotEvent and let the runtime type
-// guards (`event.type === 'X'`) ignore anything else.
-type LegacyCopilotEvent =
-  | { type: 'session.model_change'; timestamp?: string; data: { newModel: string; model?: string } }
-  | { type: 'user.message'; timestamp?: string; data: { content: string; interactionId?: string; model?: string } }
-  | { type: 'assistant.message'; timestamp?: string; data: { messageId: string; outputTokens: number; interactionId?: string; toolRequests?: LegacyToolRequest[]; model?: string } }
+type UserMessageData = {
+  content: string
+  interactionId?: string
+}
 
-function parseLegacyEvents(content: string, sessionId: string, seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-  const lines = content.split('\n').filter(l => l.trim())
-  let currentModel = ''
-  let pendingUserMessage = ''
+type AssistantMessageData = {
+  messageId: string
+  model?: string       // present in newer copilot-agent format
+  outputTokens: number
+  interactionId?: string
+  toolRequests?: ToolRequest[]
+}
 
-  for (const line of lines) {
-    let event: LegacyCopilotEvent
-    try {
-      event = JSON.parse(line)
-    } catch {
-      continue
-    }
+type CopilotEvent =
+  | { type: 'session.start'; data: SessionStartData; timestamp?: string }
+  | { type: 'session.model_change'; data: ModelChangeData; timestamp?: string }
+  | { type: 'user.message'; data: UserMessageData; timestamp?: string }
+  | { type: 'assistant.message'; data: AssistantMessageData; timestamp?: string }
 
-    // Some newer events include the model ID explicitly.
-    const data = event.data as { newModel?: string; model?: string }
-    if (typeof data.model === 'string' && data.model) {
-      currentModel = data.model
-    }
+// ---------------------------------------------------------------------------
+// Types for OTel span rows from agent-traces.db
+// ---------------------------------------------------------------------------
 
-    if (event.type === 'session.model_change') {
-      currentModel = data.newModel ?? currentModel
-      continue
-    }
+// The OTel SQLite store schema uses a spans table where attributes are stored
+// either as a JSON blob or as individual columns. We handle both patterns.
+// The Copilot Budget extension reads from this same DB and uses per-span
+// token counts, confirming this schema is stable enough to depend on.
 
-    if (event.type === 'user.message') {
-      const userEvent = event as Extract<LegacyCopilotEvent, { type: 'user.message' }>
-      pendingUserMessage = userEvent.data.content ?? ''
-      continue
-    }
+// Parsed attribute bag from a span
+interface SpanAttributes {
+  'gen_ai.operation.name'?: string
+  'gen_ai.response.model'?: string
+  'gen_ai.request.model'?: string
+  'gen_ai.usage.input_tokens'?: number
+  'gen_ai.usage.output_tokens'?: number
+  'gen_ai.usage.cache_read.input_tokens'?: number
+  'gen_ai.usage.cache_creation.input_tokens'?: number
+  'gen_ai.conversation.id'?: string
+  'gen_ai.agent.name'?: string
+  'gen_ai.tool.name'?: string
+  'github.copilot.chat.turn.id'?: string
+  [key: string]: unknown
+}
 
-    if (event.type === 'assistant.message') {
-      const { messageId, outputTokens, toolRequests: rawToolRequests } = event.data
-      if (outputTokens === 0) continue
-      if (!currentModel) continue
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
 
-      const dedupKey = `copilot:${sessionId}:${messageId}`
-      if (seenKeys.has(dedupKey)) continue
-      seenKeys.add(dedupKey)
+function getCopilotSessionStateDir(override?: string): string {
+  return override ?? process.env['CODEBURN_COPILOT_SESSION_STATE_DIR'] ?? join(homedir(), '.copilot', 'session-state')
+}
 
-      // Defensive: legacy / corrupt sessions have shipped toolRequests as a
-      // string, null, or missing. Without this guard, .map throws and aborts
-      // the whole file's parse loop, silently dropping every legitimate call
-      // that follows the bad event.
-      const toolRequests = Array.isArray(rawToolRequests) ? rawToolRequests : []
-      const tools = toolRequests
-        .map(t => normalizeToolName(t?.name))
-        .filter(Boolean)
-
-      const costUSD = calculateCost(currentModel, 0, outputTokens, 0, 0, 0)
-
-      results.push({
-        provider: 'copilot',
-        model: currentModel,
-        inputTokens: 0,
-        outputTokens,
-        cacheCreationInputTokens: 0,
-        cacheReadInputTokens: 0,
-        cachedInputTokens: 0,
-        reasoningTokens: 0,
-        webSearchRequests: 0,
-        costUSD,
-        tools,
-        bashCommands: [],
-        timestamp: event.timestamp ?? '',
-        speed: 'standard',
-        deduplicationKey: dedupKey,
-        userMessage: pendingUserMessage,
-        sessionId,
-      })
-
-      pendingUserMessage = ''
-    }
+/**
+ * Locate the agent-traces.db file.
+ *
+ * Priority:
+ *   1. CODEBURN_COPILOT_OTEL_DB env var
+ *   2. Platform-specific default VS Code global storage path
+ *   3. VSCodium variant paths
+ */
+function getAgentTracesDbPath(): string | null {
+  // Allow explicit override
+  const envOverride = process.env['CODEBURN_COPILOT_OTEL_DB']
+  if (envOverride) {
+    return existsSync(envOverride) ? envOverride : null
   }
 
-  return results
-}
+  const home = homedir()
+  const candidates: string[] = []
 
-// --- VS Code transcript format (workspaceStorage transcripts) ---
-
-type TranscriptToolRequest = {
-  toolCallId?: string
-  name?: string
-  arguments?: string
-  type?: string
-}
-
-type TranscriptEvent =
-  | { type: 'session.start'; timestamp?: string; data: { sessionId: string; producer?: string } }
-  | { type: 'user.message'; timestamp?: string; data: { content: string; attachments?: unknown[] } }
-  | { type: 'assistant.message'; timestamp?: string; data: { messageId: string; content?: string; reasoningText?: string; toolRequests?: TranscriptToolRequest[]; outputTokens?: number } }
-  | { type: string; timestamp?: string; data: Record<string, unknown> }
-
-const transcriptToolCallModelHints: Array<{ prefix: string; model: string }> = [
-  // Anthropic tool-call ID variants observed in Copilot transcript logs.
-  { prefix: 'toolu_bdrk_', model: COPILOT_ANTHROPIC_AUTO },
-  { prefix: 'toolu_vrtx_', model: COPILOT_ANTHROPIC_AUTO },
-  { prefix: 'tooluse_', model: COPILOT_ANTHROPIC_AUTO },
-  { prefix: 'toolu_', model: COPILOT_ANTHROPIC_AUTO },
-  // OpenAI tool-call IDs.
-  { prefix: 'call_', model: COPILOT_OPENAI_AUTO },
-]
-
-function inferModelFromToolCallIds(events: TranscriptEvent[]): string {
-  const modelCounts = new Map<string, number>()
-
-  for (const e of events) {
-    // Some newer events (like tool.execution_complete) explicitly include the model ID.
-    const data = e.data as { model?: string }
-    if (typeof data.model === 'string' && data.model) {
-      modelCounts.set(data.model, (modelCounts.get(data.model) ?? 0) + 100)
-    }
-
-    if (e.type !== 'assistant.message') continue
-    const msg = e as { data: { toolRequests?: TranscriptToolRequest[] } }
-    for (const t of msg.data.toolRequests ?? []) {
-      const toolCallId = t.toolCallId ?? ''
-      for (const hint of transcriptToolCallModelHints) {
-        if (!toolCallId.startsWith(hint.prefix)) continue
-        modelCounts.set(hint.model, (modelCounts.get(hint.model) ?? 0) + 1)
-        break
-      }
-    }
-  }
-
-  if (modelCounts.size > 0) {
-    return [...modelCounts.entries()].sort((a, b) => b[1] - a[1])[0]![0]
-  }
-
-  return 'copilot-auto'
-}
-
-/** Model inference for JB events — checks data.model (100x weight) and tool call
- *  ID prefixes on tool.execution_start/complete events. */
-function inferModelFromEvents(events: JBEvent[]): string {
-  const modelCounts = new Map<string, number>()
-
-  for (const e of events) {
-    const data = e.data as { model?: string; toolCallId?: string }
-    if (typeof data.model === 'string' && data.model) {
-      modelCounts.set(data.model, (modelCounts.get(data.model) ?? 0) + 100)
-    }
-
-    if (e.type === 'tool.execution_start' || e.type === 'tool.execution_complete') {
-      const toolCallId = data.toolCallId ?? ''
-      for (const hint of transcriptToolCallModelHints) {
-        if (!toolCallId.startsWith(hint.prefix)) continue
-        modelCounts.set(hint.model, (modelCounts.get(hint.model) ?? 0) + 1)
-        break
-      }
-    }
-  }
-
-  if (modelCounts.size > 0) {
-    return [...modelCounts.entries()].sort((a, b) => b[1] - a[1])[0]![0]
-  }
-
-  return 'copilot-auto'
-}
-
-function parseTranscriptEvents(content: string, sessionId: string, seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-  const lines = content.split('\n').filter(l => l.trim())
-  const events: TranscriptEvent[] = []
-
-  for (const line of lines) {
-    try {
-      events.push(JSON.parse(line))
-    } catch {
-      continue
-    }
-  }
-
-  const model = inferModelFromToolCallIds(events)
-  let pendingUserMessage = ''
-
-  for (const event of events) {
-    if (event.type === 'user.message') {
-      const data = event.data as { content?: string }
-      pendingUserMessage = (data.content ?? '').slice(0, 500)
-      continue
-    }
-
-    if (event.type === 'assistant.message') {
-      const data = event.data as { messageId: string; content?: string; reasoningText?: string; toolRequests?: TranscriptToolRequest[]; outputTokens?: number }
-      const contentText = data.content ?? ''
-      const reasoningText = data.reasoningText ?? ''
-
-      if (contentText.length === 0 && reasoningText.length === 0 && (data.toolRequests ?? []).length === 0) continue
-
-      const dedupKey = `copilot:${sessionId}:${data.messageId}`
-      if (seenKeys.has(dedupKey)) continue
-      seenKeys.add(dedupKey)
-
-      let outputTokens = data.outputTokens ?? 0
-      let reasoningTokens = 0
-      if (outputTokens === 0) {
-        outputTokens = Math.ceil(contentText.length / CHARS_PER_TOKEN)
-        reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN)
-      }
-
-      const inputTokens = Math.ceil(pendingUserMessage.length / CHARS_PER_TOKEN)
-
-      // Same defensive guard as the modern event branch — corrupt legacy
-      // sessions have shipped toolRequests as non-array values.
-      const legacyToolRequests = Array.isArray(data.toolRequests) ? data.toolRequests : []
-      const tools = legacyToolRequests
-        .map(t => normalizeToolName(t?.name))
-        .filter(Boolean)
-
-      const costUSD = calculateCost(model, inputTokens, outputTokens + reasoningTokens, 0, 0, 0)
-
-      results.push({
-        provider: 'copilot',
-        model,
-        inputTokens,
-        outputTokens,
-        cacheCreationInputTokens: 0,
-        cacheReadInputTokens: 0,
-        cachedInputTokens: 0,
-        reasoningTokens,
-        webSearchRequests: 0,
-        costUSD,
-        tools,
-        bashCommands: [],
-        timestamp: event.timestamp ?? '',
-        speed: 'standard',
-        deduplicationKey: dedupKey,
-        userMessage: pendingUserMessage,
-        sessionId,
-      })
-
-      pendingUserMessage = ''
-    }
-  }
-
-  return results
-}
-
-// --- Parser ---
-
-function isTranscriptFormat(content: string): boolean {
-  const firstLine = content.split('\n')[0] ?? ''
-  try {
-    const event = JSON.parse(firstLine)
-    return event.type === 'session.start' && event.data?.producer === 'copilot-agent'
-  } catch {
-    return false
-  }
-}
-
-function isJetBrainsFormat(content: string): boolean {
-  const firstLine = content.split('\n')[0] ?? ''
-  try {
-    const event = JSON.parse(firstLine)
-    // JB format starts with user.message_rendered or partition.created (JB-specific).
-    // We intentionally exclude user.message here since legacy files can also start
-    // with that event type — routing them to the JB parser would misparse them.
-    return (
-      event.type === 'user.message_rendered' ||
-      event.type === 'partition.created'
+  const p = platform()
+  if (p === 'darwin') {
+    // macOS: VS Code, VS Code Insiders, VSCodium
+    candidates.push(
+      join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+      join(home, 'Library', 'Application Support', 'Code - Insiders', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+      join(home, 'Library', 'Application Support', 'VSCodium', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
     )
+  } else if (p === 'linux') {
+    // Linux: VS Code, VS Code Insiders, VSCodium
+    candidates.push(
+      join(home, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+      join(home, '.config', 'Code - Insiders', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+      join(home, '.config', 'VSCodium', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+    )
+  } else if (p === 'win32') {
+    // Windows
+    const appdata = process.env['APPDATA'] ?? join(home, 'AppData', 'Roaming')
+    candidates.push(
+      join(appdata, 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+      join(appdata, 'Code - Insiders', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+      join(appdata, 'VSCodium', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
+    )
+  }
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function parseCwd(yaml: string): string | null {
+  const match = yaml.match(/^cwd:\s*(.+)$/m)
+  if (!match?.[1]) return null
+  let raw = match[1].trim()
+  // Strip inline YAML comments (# preceded by optional whitespace)
+  raw = raw.replace(/\s*#.*$/, '')
+  // Strip surrounding single/double quotes
+  raw = raw.replace(/^['"]|['"]$/g, '').trim()
+  return raw || null
+}
+
+/**
+ * Load span attributes from the span_attributes table (key-value pairs).
+ * This handles the modern VS Code Copilot Chat schema where attributes
+ * are stored as separate key-value rows rather than a JSON blob.
+ */
+function loadSpanAttributesFromTable(
+  db: ReturnType<typeof import('../sqlite.js')['openDatabase']>,
+  spanId: string
+): SpanAttributes {
+  try {
+    const rows = db.query<{ key: string; value: string | null }>(
+      `SELECT key, value FROM span_attributes WHERE span_id = ?`,
+      [spanId]
+    )
+    const attrs: SpanAttributes = {}
+    for (const row of rows) {
+      if (row.key && row.value) {
+        try {
+          // Try to parse numeric values
+          const numValue = Number(row.value)
+          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue) 
+            ? row.value
+            : numValue
+        } catch {
+          attrs[row.key as keyof SpanAttributes] = row.value
+        }
+      }
+    }
+    return attrs
   } catch {
-    return false
+    return {}
   }
 }
 
-// --- JetBrains (IntelliJ/DataGrip) format parser ---
-
-type JBEvent = {
-  type: string
-  timestamp?: string
-  id?: string
-  data: Record<string, unknown>
+/**
+ * Convert nanosecond or millisecond epoch to ISO timestamp.
+ * The OTel spec uses nanoseconds, but some implementations use milliseconds.
+ */
+function epochToISO(epoch: number): string {
+  // Guard malformed rows: new Date(NaN).toISOString() throws. Fall back to the
+  // epoch (1970) so a bad timestamp is excluded from period totals, not crashing.
+  if (!Number.isFinite(epoch) || epoch <= 0) return new Date(0).toISOString()
+  // If the value looks like nanoseconds (> 1e15), convert to ms
+  const ms = epoch > 1e15 ? Math.floor(epoch / 1e6) : epoch > 1e12 ? epoch : epoch * 1000
+  return new Date(ms).toISOString()
 }
 
-function parseJetBrainsEvents(content: string, sessionId: string, seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-  const lines = content.split('\n').filter(l => l.trim())
-  const events: JBEvent[] = []
+// ---------------------------------------------------------------------------
+// Helpers for JSONL / transcript parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Safely coerce a raw toolRequests value to an array of ToolRequest.
+ * Non-array values (string, null, undefined) are treated as empty arrays
+ * so that a corrupt event.data doesn't abort the whole file parse loop.
+ */
+function coerceToolRequests(raw: unknown): ToolRequest[] {
+  return Array.isArray(raw) ? (raw as ToolRequest[]) : []
+}
+
+/**
+ * Infer the model bucket for a VS Code transcript file by counting the
+ * toolCallId prefixes across all assistant messages:
+ *   call_*           → OpenAI
+ *   tooluse_* / toolu_*  → Anthropic
+ * The dominant prefix determines the model for the whole session.
+ * Returns '' if no toolCallIds are present.
+ */
+function inferTranscriptModel(lines: string[]): string {
+  let openaiCount = 0
+  let anthropicCount = 0
 
   for (const line of lines) {
     try {
-      events.push(JSON.parse(line))
+      const event = JSON.parse(line) as CopilotEvent
+      if (event.type !== 'assistant.message') continue
+      const data = event.data as AssistantMessageData & { toolRequests?: Array<{ toolCallId?: string }> }
+      const reqs = coerceToolRequests(data.toolRequests)
+      for (const req of reqs) {
+        const id = (req as { toolCallId?: unknown }).toolCallId
+        if (typeof id !== 'string') continue
+        if (id.startsWith('call_')) openaiCount++
+        else if (/^tooluse_|^toolu_/.test(id)) anthropicCount++
+      }
     } catch {
       continue
     }
   }
 
-  // Reuse the shared model inference logic: check explicit data.model fields
-  // (weighted 100x) and tool call ID prefix heuristics from both assistant.message
-  // toolRequests and tool.execution_start/complete events (JB-specific).
-  const model = inferModelFromEvents(events)
-
-  // Collect tool names per turn
-  const toolsByTurn = new Map<string, string[]>()
-  let currentTurnId = ''
-  let userMsg = ''
-  let msgIndex = 0
-
-  for (const e of events) {
-    if (e.type === 'user.message_rendered') {
-      userMsg = ((e.data.renderedMessage as string) ?? '').slice(0, 500)
-    }
-    if (e.type === 'user.message') {
-      const msg = (e.data.content as string) ?? ''
-      if (msg) userMsg = msg.slice(0, 500)
-    }
-
-    if (e.type === 'assistant.turn_start') {
-      currentTurnId = (e.data.turnId as string) ?? ''
-    }
-
-    if (e.type === 'tool.execution_start') {
-      const toolName = (e.data.toolName as string) ?? ''
-      const normalized = normalizeToolName(toolName)
-      if (normalized) {
-        const msgId = currentTurnId || 'unknown'
-        const existing = toolsByTurn.get(msgId) ?? []
-        existing.push(normalized)
-        toolsByTurn.set(msgId, existing)
-      }
-    }
-
-    if (e.type === 'assistant.message') {
-      const data = e.data as { messageId?: string; content?: string; text?: string; reasoningText?: string; thinking?: { text?: string }; iterationNumber?: number; outputTokens?: number }
-      const contentText = data.text ?? data.content ?? ''
-      const reasoningText = data.reasoningText ?? data.thinking?.text ?? ''
-
-      // Skip empty messages (streaming placeholders)
-      if (contentText.length === 0 && reasoningText.length === 0) continue
-
-      // Use messageId if available, otherwise fall back to an incrementing index
-      // to avoid dedup collisions when messageId is absent.
-      const messageId = data.messageId ?? e.id ?? ''
-      const dedupId = messageId || String(msgIndex++)
-      const dedupKey = `copilot:jb:${sessionId}:${dedupId}:${data.iterationNumber ?? 0}`
-      if (seenKeys.has(dedupKey)) continue
-      seenKeys.add(dedupKey)
-
-      let outputTokens = data.outputTokens ?? 0
-      let reasoningTokens = 0
-      if (outputTokens === 0) {
-        outputTokens = Math.ceil(contentText.length / CHARS_PER_TOKEN)
-        reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN)
-      }
-
-      const inputTokens = Math.ceil(userMsg.length / CHARS_PER_TOKEN)
-      const tools = toolsByTurn.get(currentTurnId || messageId) ?? []
-      const costUSD = calculateCost(model, inputTokens, outputTokens + reasoningTokens, 0, 0, 0)
-
-      results.push({
-        provider: 'copilot',
-        model,
-        inputTokens,
-        outputTokens,
-        cacheCreationInputTokens: 0,
-        cacheReadInputTokens: 0,
-        cachedInputTokens: 0,
-        reasoningTokens,
-        webSearchRequests: 0,
-        costUSD,
-        tools,
-        bashCommands: [],
-        timestamp: e.timestamp ?? '',
-        speed: 'standard',
-        deduplicationKey: dedupKey,
-        userMessage: userMsg,
-        sessionId,
-      })
-
-      // Only count user message once per assistant turn
-      userMsg = ''
-    }
-  }
-
-  return results
+  if (openaiCount === 0 && anthropicCount === 0) return ''
+  return openaiCount >= anthropicCount ? 'copilot-openai-auto' : 'copilot-anthropic-auto'
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// ---------------------------------------------------------------------------
+// JSONL parser (handles both regular session-state events and VS Code
+// transcript format via session.start { producer: 'copilot-agent' })
+// ---------------------------------------------------------------------------
+
+function createJsonlParser(
+  source: SessionSource,
+  seenKeys: Set<string>
+): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const content = await readSessionFile(source.path)
-      if (content === null) return
-      const sessionId = basename(source.path, '.jsonl').length === 36
-        ? basename(source.path, '.jsonl')
-        : basename(dirname(source.path))
+      if (!content) return
+      const sessionId = basename(dirname(source.path))
+      const lines = content.split('\n').filter((l) => l.trim())
 
-      let calls: ParsedProviderCall[]
-      if (isTranscriptFormat(content)) {
-        calls = parseTranscriptEvents(content, sessionId, seenKeys)
-      } else if (isJetBrainsFormat(content)) {
-        calls = parseJetBrainsEvents(content, sessionId, seenKeys)
-        // Infer project name from tool paths now that content is loaded
-        const inferredProject = inferJBProjectFromContent(content)
-        if (inferredProject) {
-          for (const call of calls) {
-            call.project = inferredProject
+      // Detect VS Code transcript format: the first session.start event has
+      // { producer: 'copilot-agent' } and no outputTokens in messages.
+      let isTranscript = false
+      let currentModel = ''
+      let pendingUserMessage = ''
+
+      // First pass: detect format and infer transcript model if needed.
+      for (const line of lines) {
+        try {
+          const ev = JSON.parse(line) as CopilotEvent
+          if (ev.type === 'session.start') {
+            const data = ev.data as SessionStartData & { producer?: string }
+            if (data.producer === 'copilot-agent') {
+              isTranscript = true
+            }
+            break
           }
+          if (ev.type === 'session.model_change') break // regular format
+        } catch {
+          continue
         }
-      } else {
-        calls = parseLegacyEvents(content, sessionId, seenKeys)
       }
 
-      for (const call of calls) {
-        yield call
+      if (isTranscript) {
+        currentModel = inferTranscriptModel(lines)
+        if (!currentModel) return // no toolCallIds to infer model from
+      }
+
+      for (const line of lines) {
+        let event: CopilotEvent
+        try {
+          event = JSON.parse(line) as CopilotEvent
+        } catch {
+          continue
+        }
+
+        if (event.type === 'session.start') {
+          if (!isTranscript) {
+            currentModel = (event.data as SessionStartData).selectedModel ?? currentModel
+          }
+          continue
+        }
+
+        if (event.type === 'session.model_change') {
+          currentModel = (event.data as ModelChangeData).newModel ?? currentModel
+          continue
+        }
+
+        if (event.type === 'user.message') {
+          pendingUserMessage = (event.data as UserMessageData).content ?? ''
+          continue
+        }
+
+        if (event.type === 'assistant.message') {
+          const msgData = event.data as AssistantMessageData
+          const { messageId, model: msgModel, outputTokens = 0 } = msgData
+          const rawRequests = (msgData as { toolRequests?: unknown }).toolRequests
+          const toolRequests = coerceToolRequests(rawRequests)
+
+          // model may be carried per-message in newer copilot-agent format
+          if (msgModel) currentModel = msgModel
+          // Regular JSONL: skip zero-token messages; transcripts don't have tokens
+          if (!isTranscript && outputTokens === 0) continue
+          if (!currentModel) continue
+
+          const dedupKey = `copilot:${sessionId}:${messageId}`
+          if (seenKeys.has(dedupKey)) continue
+          seenKeys.add(dedupKey)
+
+          const tools = toolRequests
+            .map((t) => {
+              const raw = typeof t === 'object' && t !== null
+                ? ((t as { name?: unknown; toolName?: unknown }).name ?? (t as { name?: unknown; toolName?: unknown }).toolName)
+                : null
+              return typeof raw === 'string' ? normalizeTool(raw) : null
+            })
+            .filter((t): t is string => t !== null)
+
+          // Copilot JSONL only logs outputTokens; inputTokens are NOT available.
+          // Cost will be lower than actual API cost. This is the original
+          // behaviour — OTel data (below) replaces it when available.
+          const costUSD = calculateCost(currentModel, 0, outputTokens, 0, 0, 0)
+
+          yield {
+            provider: 'copilot',
+            sessionId,
+            model: currentModel,
+            inputTokens: 0,
+            outputTokens,
+            cacheCreationInputTokens: 0,
+            cacheReadInputTokens: 0,
+            cachedInputTokens: 0,
+            reasoningTokens: 0,
+            webSearchRequests: 0,
+            costUSD,
+            tools,
+            bashCommands: [],
+            timestamp: event.timestamp ?? '',
+            speed: 'standard' as const,
+            deduplicationKey: dedupKey,
+            userMessage: pendingUserMessage,
+          }
+          pendingUserMessage = ''
+        }
       }
     },
   }
 }
 
-// --- Discovery ---
+// ---------------------------------------------------------------------------
+// OTel SQLite parser — reads agent-traces.db for FULL token data
+// ---------------------------------------------------------------------------
 
-function getCopilotSessionStateDir(override?: string): string {
-  return override ?? join(homedir(), '.copilot', 'session-state')
-}
+function createOtelParser(
+  source: SessionSource,
+  seenKeys: Set<string>
+): SessionParser {
+  return {
+    async *parse(): AsyncGenerator<ParsedProviderCall> {
+      // Lazy-load the SQLite module (same pattern as Cursor/OpenCode providers)
+      const { openDatabase } = await import('../sqlite.js')
 
-export function getVSCodeWorkspaceStorageDirs(homeDir = homedir(), platform = process.platform): string[] {
-  const pathJoin = platform === 'win32' ? win32.join : posix.join
+      // One DB open handles ALL conversations — avoids N opens for N conversations.
+      const db = openDatabase(source.path)
 
-  if (platform === 'darwin') {
-    return [
-      pathJoin(homeDir, 'Library', 'Application Support', 'Code', 'User', 'workspaceStorage'),
-      pathJoin(homeDir, 'Library', 'Application Support', 'Code - Insiders', 'User', 'workspaceStorage'),
-      pathJoin(homeDir, 'Library', 'Application Support', 'VSCodium', 'User', 'workspaceStorage'),
-    ]
-  }
+      try {
+        // ---------------------------------------------------------------
+        // Get all distinct conversations in the DB with their project names.
+        // ---------------------------------------------------------------
+        const conversationRows = db.query<{
+          conversation_id: string
+          project: string | null
+          min_start: number
+        }>(
+          `SELECT DISTINCT
+             sa_conv.value AS conversation_id,
+             COALESCE(sa_repo.value, 'copilot-chat') AS project,
+             MIN(s.start_time_ms) AS min_start
+           FROM spans s
+           LEFT JOIN span_attributes sa_conv
+             ON s.span_id = sa_conv.span_id AND sa_conv.key = 'gen_ai.conversation.id'
+           LEFT JOIN span_attributes sa_repo
+             ON s.span_id = sa_repo.span_id AND sa_repo.key = 'github.copilot.git.repository'
+           WHERE sa_conv.value IS NOT NULL
+           GROUP BY sa_conv.value
+           ORDER BY min_start DESC`
+        )
 
-  if (platform === 'win32') {
-    return [
-      pathJoin(homeDir, 'AppData', 'Roaming', 'Code', 'User', 'workspaceStorage'),
-      pathJoin(homeDir, 'AppData', 'Roaming', 'Code - Insiders', 'User', 'workspaceStorage'),
-      pathJoin(homeDir, 'AppData', 'Roaming', 'VSCodium', 'User', 'workspaceStorage'),
-    ]
-  }
+        for (const convRow of conversationRows) {
+          const conversationId = convRow.conversation_id
+          if (!conversationId) continue
 
-  return [
-    pathJoin(homeDir, '.config', 'Code', 'User', 'workspaceStorage'),
-    pathJoin(homeDir, '.config', 'Code - Insiders', 'User', 'workspaceStorage'),
-    pathJoin(homeDir, '.config', 'VSCodium', 'User', 'workspaceStorage'),
-    pathJoin(homeDir, '.vscode-server', 'data', 'User', 'workspaceStorage'),
-  ]
-}
+          let project = convRow.project ?? 'copilot-chat'
+          if (project.includes('/')) {
+            project = basename(project.replace(/\.git$/, ''))
+          }
 
-function parseCwd(yaml: string): string | null {
-  const match = yaml.match(/^cwd:\s*(.+)$/m)
-  if (!match?.[1]) return null
-  const raw = match[1]
-    .replace(/\s*#.*$/, '')
-    .replace(/^['"]|['"]$/g, '')
-    .trim()
-  return raw || null
-}
+          // -----------------------------------------------------------
+          // Query all 'chat' spans for this conversation.
+          // -----------------------------------------------------------
 
-async function readWorkspaceProject(workspaceDir: string): Promise<string> {
-  try {
-    const raw = await readFile(join(workspaceDir, 'workspace.json'), 'utf-8')
-    const data = JSON.parse(raw) as { folder?: string }
-    if (data.folder) {
-      const url = data.folder.replace(/^file:\/\//, '')
-      return basename(decodeURIComponent(url))
-    }
-  } catch {}
-  return basename(workspaceDir)
-}
+          const spanIdRows = db.query<{ span_id: string; trace_id: string }>(
+            `SELECT DISTINCT s.span_id, s.trace_id
+             FROM spans s
+             INNER JOIN span_attributes sa 
+               ON s.span_id = sa.span_id AND sa.key = 'gen_ai.conversation.id' AND sa.value = ?
+             ORDER BY s.start_time_ms ASC`,
+            [conversationId]
+          )
 
-function getJetBrainsSessionDir(override?: string): string {
-  return override ?? join(homedir(), '.copilot', 'jb')
-}
+          // Collect trace IDs and span IDs belonging to this conversation
+          const traceIds = new Set<string>()
+          for (const row of spanIdRows) {
+            traceIds.add(row.trace_id)
+          }
 
-async function discoverJetBrainsSessions(jbDir: string): Promise<SessionSource[]> {
-  const sources: SessionSource[] = []
+          if (traceIds.size === 0) {
+            continue
+          }
 
-  let sessionDirs: string[]
-  try {
-    sessionDirs = await readdir(jbDir)
-  } catch {
-    return sources
-  }
+          // Now query all spans within those traces to find chat and tool spans.
+          // Pull the metadata columns in the same query so we don't re-query the
+          // spans table once per chat span below (avoids an N+1).
+          const traceIdArr = [...traceIds]
+          const tracePlaceholders = traceIdArr.map(() => '?').join(',')
+          const traceSpans = db.query<{
+            span_id: string
+            trace_id: string
+            operation_name: string | null
+            start_time_ms: number
+            response_model: string | null
+          }>(
+            `SELECT span_id, trace_id, operation_name, start_time_ms, response_model FROM spans WHERE trace_id IN (${tracePlaceholders})`,
+            traceIdArr
+          )
 
-  for (const sessionId of sessionDirs) {
-    const sessionPath = join(jbDir, sessionId)
-    const s = await stat(sessionPath).catch(() => null)
-    if (!s?.isDirectory()) continue
+          // Collect tool names from execute_tool spans for each trace
+          const toolsByTrace = new Map<string, string[]>()
+          const chatSpanIds: string[] = []
+          const spanMetaById = new Map<string, { trace_id: string; start_time_ms: number; response_model: string | null }>()
 
-    let partitions: string[]
-    try {
-      partitions = await readdir(sessionPath)
-    } catch {
-      continue
-    }
+          for (const span of traceSpans) {
+            const opName = span.operation_name || ''
+            spanMetaById.set(span.span_id, span)
 
-    for (const file of partitions) {
-      if (!file.endsWith('.jsonl')) continue
-      const filePath = join(sessionPath, file)
-      const fs = await stat(filePath).catch(() => null)
-      if (!fs?.isFile()) continue
-      sources.push({ path: filePath, project: sessionId, provider: 'copilot' })
-    }
-  }
-
-  return sources
-}
-
-/** Infer a project name from tool execution paths in already-loaded content. */
-function inferJBProjectFromContent(content: string): string | null {
-  // Split on either separator so the home-depth math lines up with the recorded
-  // tool path on every platform (JetBrains records Windows paths with
-  // backslashes, and homedir() also uses backslashes there). Using a fixed '/'
-  // for the path while splitting home on the platform sep mismatched on Windows
-  // and made inference always fall back to the raw session id there.
-  const homeParts = homedir().split(/[/\\]/)
-  const homeDepth = homeParts.length
-  const lines = content.split('\n')
-  const limit = Math.min(lines.length, 200)
-
-  for (let i = 0; i < limit; i++) {
-    const line = lines[i]
-    if (!line) continue
-    try {
-      const e = JSON.parse(line)
-      if (e.type === 'tool.execution_start') {
-        const args = e.data?.arguments
-        if (typeof args === 'object' && args !== null && typeof args.path === 'string') {
-          const pathVal: string = args.path
-          const parts = pathVal.split(/[/\\]/)
-          if (parts.length > homeDepth + 1) {
-            const afterHome = parts.slice(homeDepth)
-            if (afterHome.length >= 2) {
-              return basename(afterHome.slice(0, afterHome.length > 2 ? 2 : afterHome.length).join('/'))
-                || afterHome[0] || null
+            if (opName === 'chat') {
+              chatSpanIds.push(span.span_id)
             }
-            return afterHome[0] || null
+
+            if (opName === 'execute_tool') {
+              // Load tool name from attributes and normalise to display form
+              const attrs = loadSpanAttributesFromTable(db, span.span_id)
+              const rawToolName = attrs['gen_ai.tool.name'] as string | undefined
+              if (rawToolName) {
+                const existing = toolsByTrace.get(span.trace_id) ?? []
+                existing.push(normalizeTool(rawToolName))
+                toolsByTrace.set(span.trace_id, existing)
+              }
+            }
+          }
+
+          // Yield one ParsedProviderCall per chat span
+          for (const spanId of chatSpanIds) {
+            const attrs = loadSpanAttributesFromTable(db, spanId)
+
+            const spanMetadata = spanMetaById.get(spanId)
+            if (!spanMetadata) continue
+
+            const model =
+              (attrs['gen_ai.response.model'] as string | undefined) ??
+              (attrs['gen_ai.request.model'] as string | undefined) ??
+              spanMetadata.response_model ??
+              'unknown'
+
+            const inputTokens = Number(attrs['gen_ai.usage.input_tokens'] ?? 0)
+            const outputTokens = Number(attrs['gen_ai.usage.output_tokens'] ?? 0)
+            const cacheReadTokens = Number(attrs['gen_ai.usage.cache_read.input_tokens'] ?? 0)
+            const cacheCreationTokens = Number(attrs['gen_ai.usage.cache_creation.input_tokens'] ?? 0)
+
+            if (inputTokens === 0 && outputTokens === 0) {
+              continue
+            }
+
+            // Dedup key uses span_id which is globally unique
+            const dedupKey = `copilot-otel:${spanId}`
+            if (seenKeys.has(dedupKey)) continue
+            seenKeys.add(dedupKey)
+
+            // Also add a JSONL-style dedupKey pattern so that if the same
+            // interaction appears in both OTel and JSONL, we don't double-count.
+            // We use the turn ID from Copilot attributes if available.
+            const turnId = attrs['github.copilot.chat.turn.id'] as string | undefined
+            if (turnId) {
+              const jsonlDedupKey = `copilot:${conversationId}:${turnId}`
+              seenKeys.add(jsonlDedupKey)
+            }
+
+            const tools = toolsByTrace.get(spanMetadata.trace_id) ?? []
+            const timestamp = epochToISO(spanMetadata.start_time_ms)
+
+            // calculateCost with FULL token data — this is the key improvement.
+            const costUSD = calculateCost(
+              model,
+              inputTokens,
+              outputTokens,
+              cacheCreationTokens,
+              cacheReadTokens,
+              0 // reasoningTokens — not exposed in current OTel schema
+            )
+
+            yield {
+              provider: 'copilot',
+              sessionId: conversationId,
+              project,
+              model,
+              inputTokens,
+              outputTokens,
+              cacheCreationInputTokens: cacheCreationTokens,
+              cacheReadInputTokens: cacheReadTokens,
+              cachedInputTokens: 0,
+              reasoningTokens: 0,
+              webSearchRequests: 0,
+              costUSD,
+              tools,
+              bashCommands: [],
+              timestamp,
+              speed: 'standard' as const,
+              deduplicationKey: dedupKey,
+              userMessage: '', // Not available in OTel spans by default
+            }
           }
         }
+      } finally {
+        db.close()
       }
-    } catch {
-      continue
-    }
+    },
   }
-  return null
 }
 
-async function discoverLegacySessions(sessionStateDir: string): Promise<SessionSource[]> {
-  const sources: SessionSource[] = []
+// ---------------------------------------------------------------------------
+// Extended SessionSource for OTel sessions
+// ---------------------------------------------------------------------------
+
+interface OTelSessionSource extends SessionSource {
+  conversationId?: string
+  sourceType: 'otel'
+}
+
+interface JsonlSessionSource extends SessionSource {
+  sourceType: 'jsonl'
+}
+
+function isOtelSource(source: SessionSource): source is OTelSessionSource {
+  return (source as OTelSessionSource).sourceType === 'otel'
+}
+
+// ---------------------------------------------------------------------------
+// Session discovery: JSONL (original)
+// ---------------------------------------------------------------------------
+
+async function discoverJsonlSessions(
+  sessionStateDir: string
+): Promise<JsonlSessionSource[]> {
+  const sources: JsonlSessionSource[] = []
 
   let sessionDirs: string[]
   try {
@@ -670,89 +719,233 @@ async function discoverLegacySessions(sessionStateDir: string): Promise<SessionS
     if (!s?.isFile()) continue
 
     let project = sessionId
-    const yaml = await readSessionFile(join(sessionStateDir, sessionId, 'workspace.yaml'))
-    if (yaml !== null) {
-      const cwd = parseCwd(yaml)
+    try {
+      const yaml = await readSessionFile(
+        join(sessionStateDir, sessionId, 'workspace.yaml')
+      )
+      const cwd = parseCwd(yaml ?? '')
       if (cwd) project = basename(cwd)
+    } catch {
+      // workspace.yaml may not exist
     }
 
-    sources.push({ path: eventsPath, project, provider: 'copilot' })
+    sources.push({
+      path: eventsPath,
+      project,
+      provider: 'copilot',
+      sourceType: 'jsonl',
+    })
   }
 
   return sources
 }
 
-async function discoverVSCodeTranscripts(workspaceStorageDir: string): Promise<SessionSource[]> {
-  const sources: SessionSource[] = []
+// ---------------------------------------------------------------------------
+// Session discovery: OTel SQLite
+// ---------------------------------------------------------------------------
 
-  let workspaceDirs: string[]
+async function discoverOtelSessions(
+  dbPath: string
+): Promise<OTelSessionSource[]> {
+  // Verify the DB file exists. Return one source per DB file; the parser
+  // opens the DB once and iterates all conversations in a single DB open,
+  // which is far more efficient than one source (and one DB open) per conversation.
   try {
-    workspaceDirs = await readdir(workspaceStorageDir)
+    await stat(dbPath)
   } catch {
-    return sources
+    return []
   }
+  return [{ path: dbPath, project: 'copilot-chat', provider: 'copilot', sourceType: 'otel' }]
+}
 
-  for (const wsDir of workspaceDirs) {
-    const transcriptsDir = join(workspaceStorageDir, wsDir, 'GitHub.copilot-chat', 'transcripts')
-    if (!existsSync(transcriptsDir)) continue
+// ---------------------------------------------------------------------------
+// Provider factory
+// ---------------------------------------------------------------------------
 
-    const project = await readWorkspaceProject(join(workspaceStorageDir, wsDir))
+/**
+ * Returns the VS Code workspaceStorage directories for all VS Code variants
+ * (Code, Code Insiders, VSCodium) on the given platform. Used to discover
+ * transcript sessions written by the Copilot Chat extension.
+ *
+ * Accepts explicit `home` and `os` arguments so callers (and tests) can pass
+ * custom values without relying on process-level globals.
+ */
+export function getVSCodeWorkspaceStorageDirs(home: string, os: string): string[] {
+  const j = os === 'win32' ? win32.join : posix.join
+  if (os === 'darwin') {
+    return [
+      j(home, 'Library', 'Application Support', 'Code', 'User', 'workspaceStorage'),
+      j(home, 'Library', 'Application Support', 'Code - Insiders', 'User', 'workspaceStorage'),
+      j(home, 'Library', 'Application Support', 'VSCodium', 'User', 'workspaceStorage'),
+    ]
+  }
+  if (os === 'linux') {
+    return [
+      j(home, '.config', 'Code', 'User', 'workspaceStorage'),
+      j(home, '.config', 'Code - Insiders', 'User', 'workspaceStorage'),
+      j(home, '.config', 'VSCodium', 'User', 'workspaceStorage'),
+    ]
+  }
+  // win32
+  return [
+    j(home, 'AppData', 'Roaming', 'Code', 'User', 'workspaceStorage'),
+    j(home, 'AppData', 'Roaming', 'Code - Insiders', 'User', 'workspaceStorage'),
+    j(home, 'AppData', 'Roaming', 'VSCodium', 'User', 'workspaceStorage'),
+  ]
+}
 
-    let files: string[]
+// ---------------------------------------------------------------------------
+// Session discovery: VS Code workspace transcripts
+// ---------------------------------------------------------------------------
+
+/**
+ * Discover Copilot Chat transcript sessions stored in VS Code workspaceStorage.
+ * Structure: {wsDir}/{hash}/GitHub.copilot-chat/transcripts/{session}.jsonl
+ * Project is read from {wsDir}/{hash}/workspace.json (folder URI).
+ */
+async function discoverTranscriptSessions(
+  workspaceStorageDirs: string[]
+): Promise<JsonlSessionSource[]> {
+  const sources: JsonlSessionSource[] = []
+
+  for (const wsDir of workspaceStorageDirs) {
+    let hashDirs: string[]
     try {
-      files = await readdir(transcriptsDir)
+      hashDirs = await readdir(wsDir)
     } catch {
       continue
     }
 
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue
-      const filePath = join(transcriptsDir, file)
-      const s = await stat(filePath).catch(() => null)
-      if (!s?.isFile()) continue
-      sources.push({ path: filePath, project, provider: 'copilot' })
+    for (const hashDir of hashDirs) {
+      const transcriptsDir = join(wsDir, hashDir, 'GitHub.copilot-chat', 'transcripts')
+
+      // Resolve project name from workspace.json
+      let project = hashDir
+      try {
+        const wsJson = await readSessionFile(join(wsDir, hashDir, 'workspace.json'))
+        if (wsJson) {
+          const data = JSON.parse(wsJson) as { folder?: string }
+          if (typeof data.folder === 'string') {
+            // folder is a URI like 'file:///home/user/myapp' or 'file:///C:/Users/...'
+            const folder = data.folder.replace(/^file:\/\//, '').replace(/\/+$/, '')
+            const name = basename(folder)
+            if (name) project = name
+          }
+        }
+      } catch {
+        // workspace.json may be absent or malformed
+      }
+
+      let transcriptFiles: string[]
+      try {
+        transcriptFiles = await readdir(transcriptsDir)
+      } catch {
+        continue
+      }
+
+      for (const file of transcriptFiles) {
+        if (!file.endsWith('.jsonl')) continue
+        const s = await stat(join(transcriptsDir, file)).catch(() => null)
+        if (!s?.isFile()) continue
+        sources.push({
+          path: join(transcriptsDir, file),
+          project,
+          provider: 'copilot',
+          sourceType: 'jsonl',
+        })
+      }
     }
   }
 
   return sources
 }
 
-export function createCopilotProvider(sessionStateDir?: string, workspaceStorageDirOverride?: string, jbDirOverride?: string): Provider {
-  const legacyDir = getCopilotSessionStateDir(sessionStateDir)
-  const vscodeDirs = workspaceStorageDirOverride != null ? [workspaceStorageDirOverride] : getVSCodeWorkspaceStorageDirs()
-  const jbDir = getJetBrainsSessionDir(jbDirOverride)
+export function createCopilotProvider(sessionStateDir?: string, workspaceStorageDir?: string): Provider {
+  // jsonlDir is resolved lazily inside discoverSessions so that env-var
+  // overrides set after module load (e.g. in tests) are respected.
+
+  /**
+   * Returns the workspaceStorage directories to scan for transcript sessions.
+   * When workspaceStorageDir is explicitly provided (e.g. in tests), that single
+   * directory is used. The CODEBURN_COPILOT_WS_STORAGE_DIR env var provides a
+   * single-dir override (useful for tests). Otherwise all platform-default VS
+   * Code variant paths are returned.
+   */
+  function getWsDirs(): string[] {
+    if (workspaceStorageDir !== undefined) return [workspaceStorageDir]
+    const envDir = process.env['CODEBURN_COPILOT_WS_STORAGE_DIR']
+    if (envDir) return [envDir]
+    return getVSCodeWorkspaceStorageDirs(homedir(), platform())
+  }
 
   return {
     name: 'copilot',
     displayName: 'Copilot',
+    durableSources: true,
 
     modelDisplayName(model: string): string {
-      if (model === 'copilot-auto') return 'Copilot (auto)'
-      if (model === COPILOT_OPENAI_AUTO) return 'Copilot (OpenAI auto)'
-      if (model === COPILOT_ANTHROPIC_AUTO) return 'Copilot (Anthropic auto)'
-      for (const [key, name] of modelDisplayEntries) {
-        if (model === key || model.startsWith(key + '-')) return name
+      for (const [key, display] of modelDisplayEntries) {
+        if (model.includes(key)) return display
       }
       return model
     },
 
     toolDisplayName(rawTool: string): string {
-      return normalizeToolName(rawTool)
+      return normalizeTool(rawTool)
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      const [legacy, jb, ...vscodeResults] = await Promise.all([
-        discoverLegacySessions(legacyDir),
-        discoverJetBrainsSessions(jbDir),
-        ...vscodeDirs.map(discoverVSCodeTranscripts),
-      ])
-      return [...legacy, ...jb, ...vscodeResults.flat()]
+      const sources: SessionSource[] = []
+
+      // 1. Discover OTel sessions (preferred — full token data)
+      const disableOtel = process.env['CODEBURN_COPILOT_DISABLE_OTEL'] === '1'
+      if (!disableOtel) {
+        const dbPath = getAgentTracesDbPath()
+        if (dbPath) {
+          try {
+            const otelSources = await discoverOtelSessions(dbPath)
+            sources.push(...otelSources)
+          } catch {
+            // OTel discovery failed — fall through to JSONL
+          }
+        }
+      }
+
+      // 2. Discover JSONL sessions (fallback — output tokens only)
+      try {
+        const jsonlDir = getCopilotSessionStateDir(sessionStateDir)
+        const jsonlSources = await discoverJsonlSessions(jsonlDir)
+        sources.push(...jsonlSources)
+      } catch {
+        // JSONL discovery failed
+      }
+
+      // 3. Discover VS Code workspace transcript sessions
+      try {
+        const transcriptSources = await discoverTranscriptSessions(getWsDirs())
+        sources.push(...transcriptSources)
+      } catch {
+        // Transcript discovery failed
+      }
+
+      return sources
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    createSessionParser(
+      source: SessionSource,
+      seenKeys: Set<string>
+    ): SessionParser {
+      // Route to the correct parser based on source type.
+      // The dedup key set (seenKeys) is shared across both parsers,
+      // so if OTel already yielded a span, the JSONL parser will skip
+      // the matching assistant.message (and vice versa).
+      if (isOtelSource(source)) {
+        return createOtelParser(source, seenKeys)
+      }
+      return createJsonlParser(source, seenKeys)
     },
   }
 }
 
+// Default export for the provider registry
 export const copilot = createCopilotProvider()

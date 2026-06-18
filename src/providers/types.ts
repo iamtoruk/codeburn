@@ -41,6 +41,11 @@ export type Provider = {
   // Data comes from a live API fetch (no on-disk file). Such sources can't be
   // fingerprinted or incrementally cached, so the parser re-fetches every run.
   network?: boolean
+  // Source data is managed by an external process that may prune old records
+  // (e.g. VS Code's OTel agent-traces.db). Cached entries for discovered paths
+  // are never evicted, and orphaned entries (paths no longer discovered) are
+  // kept and included in query-time aggregation so the monthly total never drops.
+  durableSources?: boolean
   modelDisplayName(model: string): string
   toolDisplayName(rawTool: string): string
   discoverSessions(): Promise<SessionSource[]>

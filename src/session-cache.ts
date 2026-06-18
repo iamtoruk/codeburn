@@ -71,6 +71,8 @@ export type CachedFile = {
 export type ProviderSection = {
   envFingerprint: string
   files: Record<string, CachedFile>
+  /** True when the provider's cache entries survive source-file eviction. */
+  durable?: boolean
 }
 
 export type SessionCache = {
@@ -100,10 +102,14 @@ const PROVIDER_ENV_VARS: Record<string, string[]> = {
   'ibm-bob': ['XDG_CONFIG_HOME'],
 }
 
+// Names of providers whose cache entries are never evicted when source files
+// disappear — they are preserved so month-to-date totals never drop.
+export const DURABLE_PROVIDER_NAMES: ReadonlySet<string> = new Set(['copilot'])
+
 const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   claude: 'cowork-space-grouping-v1',
   cline: 'worktree-project-grouping-v1',
-  copilot: 'mcp-tool-normalization-v1',
+  copilot: 'otel-durable-v1',
   'ibm-bob': 'worktree-project-grouping-v1',
   'kilo-code': 'worktree-project-grouping-v1',
   'roo-code': 'worktree-project-grouping-v1',

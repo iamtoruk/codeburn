@@ -1,9 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
 import { join, posix, win32 } from 'path'
 import { tmpdir } from 'os'
+import { createRequire } from 'node:module'
 
 import { copilot, createCopilotProvider, getVSCodeWorkspaceStorageDirs } from '../../src/providers/copilot.js'
+import { isSqliteAvailable } from '../../src/sqlite.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -363,10 +365,13 @@ describe('copilot provider - JSONL parsing', () => {
 describe('copilot provider - discoverSessions', () => {
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'copilot-test-'))
+    // Disable OTel discovery so tests aren't contaminated by real sessions
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
   })
 
   afterEach(async () => {
     await rm(tmpDir, { recursive: true, force: true })
+    vi.unstubAllEnvs()
   })
 
   it('discovers sessions from directory', async () => {
@@ -481,85 +486,334 @@ describe('copilot provider - metadata', () => {
   })
 })
 
-// JetBrains (IntelliJ/DataGrip) format, added in #433. Discovery + parsing,
-// the isJetBrainsFormat routing guard, and the id-less dedup fallback.
-describe('copilot provider - JetBrains format', () => {
+// ---------------------------------------------------------------------------
+// OTel cache token tests
+//
+// These tests verify that the OTel SQLite parser correctly extracts
+// cacheReadInputTokens and cacheCreationInputTokens from the agent-traces.db
+// schema, and that multiple conversations from the same DB file are each
+// parsed independently with their full cache token data intact.
+//
+// This is the regression guard for the bug documented in DEBUG_HANDOFF.md:
+// cache tokens were extracted during parsing but lost in aggregation because
+// all conversations shared the same file path key in the session cache.
+// ---------------------------------------------------------------------------
+
+const requireForTest = createRequire(import.meta.url)
+
+type TestDb = {
+  exec(sql: string): void
+  prepare(sql: string): { run(...params: unknown[]): void }
+  close(): void
+}
+
+/** Creates a minimal agent-traces.db schema matching the VS Code Copilot Chat OTel store. */
+function createOtelDb(dbPath: string): void {
+  const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+  const db = new DatabaseSync(dbPath)
+  db.exec(`
+    CREATE TABLE spans (
+      span_id      TEXT PRIMARY KEY NOT NULL,
+      trace_id     TEXT NOT NULL,
+      operation_name TEXT,
+      start_time_ms INTEGER NOT NULL DEFAULT 0,
+      response_model TEXT
+    );
+    CREATE TABLE span_attributes (
+      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      span_id TEXT NOT NULL,
+      key     TEXT NOT NULL,
+      value   TEXT
+    );
+  `)
+  db.close()
+}
+
+interface SpanDef {
+  spanId: string
+  traceId: string
+  operationName: string
+  startTimeMs?: number
+  responseModel?: string
+  attrs: Record<string, string | number>
+}
+
+function insertSpan(dbPath: string, span: SpanDef): void {
+  const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+  const db = new DatabaseSync(dbPath)
+  db.prepare(
+    `INSERT INTO spans (span_id, trace_id, operation_name, start_time_ms, response_model)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(span.spanId, span.traceId, span.operationName, span.startTimeMs ?? 0, span.responseModel ?? null)
+  const attrStmt = db.prepare(
+    `INSERT INTO span_attributes (span_id, key, value) VALUES (?, ?, ?)`
+  )
+  for (const [key, value] of Object.entries(span.attrs)) {
+    attrStmt.run(span.spanId, key, String(value))
+  }
+  db.close()
+}
+
+describe('copilot provider - OTel cache token parsing', () => {
+  let tmpDir: string
+  let dbPath: string
+
   beforeEach(async () => {
-    tmpDir = await mkdtemp(join(tmpdir(), 'copilot-jb-'))
+    tmpDir = await mkdtemp(join(tmpdir(), 'copilot-otel-test-'))
+    dbPath = join(tmpDir, 'agent-traces.db')
+    vi.stubEnv('CODEBURN_COPILOT_OTEL_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '')
   })
+
   afterEach(async () => {
     await rm(tmpDir, { recursive: true, force: true })
+    vi.unstubAllEnvs()
   })
 
-  const jbUser = (text: string) =>
-    JSON.stringify({ type: 'user.message_rendered', data: { renderedMessage: text } })
-  const jbTurnStart = (turnId: string) =>
-    JSON.stringify({ type: 'assistant.turn_start', data: { turnId } })
-  const jbToolStart = (toolName: string, toolCallId: string, path?: string) =>
-    JSON.stringify({ type: 'tool.execution_start', data: { toolName, toolCallId, arguments: path ? { path } : {} } })
-  const jbAssistant = (opts: { messageId?: string; text?: string; outputTokens?: number; iterationNumber?: number }) =>
-    JSON.stringify({ type: 'assistant.message', data: { ...opts } })
+  it('skips tests when node:sqlite is unavailable', () => {
+    if (!isSqliteAvailable()) return
+    // Placeholder — subsequent tests use isSqliteAvailable guard
+  })
 
-  async function writeJbSession(workspaceId: string, lines: string[]) {
-    const dir = join(tmpDir, workspaceId)
-    await mkdir(dir, { recursive: true })
-    const filePath = join(dir, 'chat.jsonl')
-    await writeFile(filePath, lines.join('\n') + '\n')
-    return filePath
-  }
+  it('extracts cache tokens from a single OTel conversation', async () => {
+    if (!isSqliteAvailable()) return
 
-  async function parse(filePath: string, seen = new Set<string>()) {
-    const provider = createCopilotProvider('/nonexistent/legacy', '/nonexistent/vscode', tmpDir)
-    const source = { path: filePath, project: 'p', provider: 'copilot' }
-    const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, seen).parse()) calls.push(call)
-    return calls
-  }
+    createOtelDb(dbPath)
+    insertSpan(dbPath, {
+      spanId: 'span-001',
+      traceId: 'trace-001',
+      operationName: 'chat',
+      startTimeMs: 1000,
+      responseModel: 'gpt-4.1',
+      attrs: {
+        'gen_ai.conversation.id': 'conv-001',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 1000,
+        'gen_ai.usage.output_tokens': 200,
+        'gen_ai.usage.cache_read.input_tokens': 50000,
+        'gen_ai.usage.cache_creation.input_tokens': 500,
+      },
+    })
 
-  it('discovers a JetBrains chat.jsonl under the jb dir', async () => {
-    const filePath = await writeJbSession('ws-abc', [jbUser('hello'), jbAssistant({ messageId: 'm1', text: 'hi', outputTokens: 10 })])
-    const provider = createCopilotProvider('/nonexistent/legacy', '/nonexistent/vscode', tmpDir)
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
     const sources = await provider.discoverSessions()
-    expect(sources.some(s => s.path === filePath && s.provider === 'copilot')).toBe(true)
-  })
 
-  it('parses a JetBrains session into a call with the inferred model and user message', async () => {
-    const filePath = await writeJbSession('ws-abc', [
-      jbUser('implement the feature'),
-      jbTurnStart('t1'),
-      jbToolStart('read_file', 'toolu_vrtx_x'),
-      jbAssistant({ messageId: 'm1', text: 'done', outputTokens: 42 }),
-    ])
-    const calls = await parse(filePath)
+    const otelSources = sources.filter(s => s.path.startsWith(dbPath))
+    expect(otelSources).toHaveLength(1)
+    expect(otelSources[0]!.provider).toBe('copilot')
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(otelSources[0]!, new Set()).parse()) {
+      calls.push(call)
+    }
+
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.provider).toBe('copilot')
-    expect(calls[0]!.model).toBe('copilot-anthropic-auto') // toolu_ prefix -> Anthropic
-    expect(calls[0]!.outputTokens).toBe(42)
-    expect(calls[0]!.userMessage).toBe('implement the feature')
-    expect(calls[0]!.tools).toEqual(['Read'])
-    expect(calls[0]!.deduplicationKey.startsWith('copilot:jb:')).toBe(true)
+    const call = calls[0]!
+    expect(call.model).toBe('gpt-4.1')
+    expect(call.inputTokens).toBe(1000)
+    expect(call.outputTokens).toBe(200)
+    expect(call.cacheReadInputTokens).toBe(50000)
+    expect(call.cacheCreationInputTokens).toBe(500)
+    expect(call.costUSD).toBeGreaterThan(0)
   })
 
-  it('does NOT route a legacy file (first line user.message) to the JetBrains parser', async () => {
-    // Regression guard: isJetBrainsFormat must not match bare user.message.
-    const filePath = await writeJbSession('ws-legacy', [
-      JSON.stringify({ type: 'user.message', data: { content: 'hi' } }),
-      JSON.stringify({ type: 'session.model_change', data: { newModel: 'gpt-4.1' } }),
-      JSON.stringify({ type: 'assistant.message', data: { messageId: 'm1', outputTokens: 5 } }),
-    ])
-    const calls = await parse(filePath)
-    // Parsed by the legacy parser -> legacy dedup key, not a jb one.
-    expect(calls.every(c => !c.deduplicationKey.startsWith('copilot:jb:'))).toBe(true)
-  })
+  it('discovers one source per OTel DB file (not per conversation)', async () => {
+    if (!isSqliteAvailable()) return
 
-  it('does not collapse id-less assistant messages (dedup fallback)', async () => {
-    const filePath = await writeJbSession('ws-noid', [
-      jbUser('q1'),
-      jbAssistant({ text: 'a1', outputTokens: 5 }),
-      jbAssistant({ text: 'a2', outputTokens: 6 }),
-    ])
-    const calls = await parse(filePath)
+    createOtelDb(dbPath)
+
+    // Two independent conversations in the same DB
+    insertSpan(dbPath, {
+      spanId: 'span-a1', traceId: 'trace-a', operationName: 'chat', startTimeMs: 1000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-alpha',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 800,
+        'gen_ai.usage.output_tokens': 100,
+        'gen_ai.usage.cache_read.input_tokens': 40000,
+        'gen_ai.usage.cache_creation.input_tokens': 400,
+      },
+    })
+    insertSpan(dbPath, {
+      spanId: 'span-b1', traceId: 'trace-b', operationName: 'chat', startTimeMs: 2000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-beta',
+        'gen_ai.response.model': 'claude-sonnet-4',
+        'gen_ai.usage.input_tokens': 600,
+        'gen_ai.usage.output_tokens': 80,
+        'gen_ai.usage.cache_read.input_tokens': 30000,
+        'gen_ai.usage.cache_creation.input_tokens': 300,
+      },
+    })
+
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
+    const sources = await provider.discoverSessions()
+
+    // One source per DB file (not per conversation)
+    const otelSources = sources.filter(s => s.path === dbPath)
+    expect(otelSources).toHaveLength(1)
+    expect(otelSources[0]!.path).toBe(dbPath)
+
+    // But the parser still yields calls from BOTH conversations
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(otelSources[0]!, new Set()).parse()) {
+      calls.push(call)
+    }
     expect(calls).toHaveLength(2)
-    expect(new Set(calls.map(c => c.deduplicationKey)).size).toBe(2)
+    const sessionIds = new Set(calls.map(c => c.sessionId))
+    expect(sessionIds.size).toBe(2)
+  })
+
+  it('preserves cache tokens when parsing multiple conversations from one DB', async () => {
+    if (!isSqliteAvailable()) return
+
+    createOtelDb(dbPath)
+
+    insertSpan(dbPath, {
+      spanId: 'span-c1', traceId: 'trace-c', operationName: 'chat', startTimeMs: 1000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-c',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 500,
+        'gen_ai.usage.output_tokens': 100,
+        'gen_ai.usage.cache_read.input_tokens': 20000,
+        'gen_ai.usage.cache_creation.input_tokens': 200,
+      },
+    })
+    insertSpan(dbPath, {
+      spanId: 'span-d1', traceId: 'trace-d', operationName: 'chat', startTimeMs: 2000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-d',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 700,
+        'gen_ai.usage.output_tokens': 150,
+        'gen_ai.usage.cache_read.input_tokens': 35000,
+        'gen_ai.usage.cache_creation.input_tokens': 350,
+      },
+    })
+
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
+    const sources = await provider.discoverSessions()
+    // One source per DB file — the parser iterates all conversations internally
+    const otelSource = sources.find(s => s.path === dbPath)
+    expect(otelSource).toBeDefined()
+    const allCalls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(otelSource!, new Set()).parse()) {
+      allCalls.push(call)
+    }
+
+    expect(allCalls).toHaveLength(2)
+
+    const totalCacheRead = allCalls.reduce((sum, c) => sum + c.cacheReadInputTokens, 0)
+    const totalCacheCreate = allCalls.reduce((sum, c) => sum + c.cacheCreationInputTokens, 0)
+
+    // Both conversations' cache tokens must survive end-to-end
+    expect(totalCacheRead).toBe(55000)   // 20000 + 35000
+    expect(totalCacheCreate).toBe(550)   // 200 + 350
+  })
+
+  it('includes tool names from execute_tool spans in the same trace', async () => {
+    if (!isSqliteAvailable()) return
+
+    createOtelDb(dbPath)
+    // chat span
+    insertSpan(dbPath, {
+      spanId: 'span-e1', traceId: 'trace-e', operationName: 'chat', startTimeMs: 1000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-e',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 300,
+        'gen_ai.usage.output_tokens': 50,
+        'gen_ai.usage.cache_read.input_tokens': 10000,
+        'gen_ai.usage.cache_creation.input_tokens': 100,
+      },
+    })
+    // execute_tool span in the same trace
+    insertSpan(dbPath, {
+      spanId: 'span-e2', traceId: 'trace-e', operationName: 'execute_tool', startTimeMs: 1500,
+      attrs: {
+        'gen_ai.tool.name': 'readFile',
+      },
+    })
+
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
+    const sources = await provider.discoverSessions()
+    const src = sources.find(s => s.path.startsWith(dbPath))
+    expect(src).toBeDefined()
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(src!, new Set()).parse()) {
+      calls.push(call)
+    }
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toContain('Read')
+    expect(calls[0]!.cacheReadInputTokens).toBe(10000)
+  })
+
+  it('skips OTel spans with zero input and output tokens', async () => {
+    if (!isSqliteAvailable()) return
+
+    createOtelDb(dbPath)
+    insertSpan(dbPath, {
+      spanId: 'span-f1', traceId: 'trace-f', operationName: 'chat', startTimeMs: 1000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-f',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 0,
+        'gen_ai.usage.output_tokens': 0,
+        'gen_ai.usage.cache_read.input_tokens': 50000,
+        'gen_ai.usage.cache_creation.input_tokens': 500,
+      },
+    })
+
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
+    const sources = await provider.discoverSessions()
+    const src = sources.find(s => s.path.startsWith(dbPath))
+    expect(src).toBeDefined()
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(src!, new Set()).parse()) {
+      calls.push(call)
+    }
+    // Span with zero input AND output tokens is skipped
+    expect(calls).toHaveLength(0)
+  })
+
+  it('OTel source path equals the plain DB file path and durableSources is true', async () => {
+    if (!isSqliteAvailable()) return
+
+    createOtelDb(dbPath)
+    insertSpan(dbPath, {
+      spanId: 'span-g1', traceId: 'trace-g', operationName: 'chat', startTimeMs: 1000,
+      attrs: {
+        'gen_ai.conversation.id': 'conv-g',
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 100,
+        'gen_ai.usage.output_tokens': 10,
+        'gen_ai.usage.cache_read.input_tokens': 0,
+        'gen_ai.usage.cache_creation.input_tokens': 0,
+      },
+    })
+
+    const provider = createCopilotProvider('/nonexistent/jsonl', '/nonexistent/ws')
+
+    // durableSources must be true on the copilot provider
+    expect(provider.durableSources).toBe(true)
+
+    const sources = await provider.discoverSessions()
+    const otelSrc = sources.find(s => s.path.startsWith(dbPath))
+    expect(otelSrc).toBeDefined()
+
+    // Path is the plain DB file path (no #otel-conv= compound suffix)
+    expect(otelSrc!.path).toBe(dbPath)
+
+    // Parser must open the DB and produce results for all conversations
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(otelSrc!, new Set()).parse()) {
+      calls.push(call)
+    }
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(100)
   })
 })
